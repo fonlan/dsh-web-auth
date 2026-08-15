@@ -1,0 +1,23 @@
+# dsh-web-auth bundle patch
+#
+# This file is the `dsh.bundle.patch` layer of this package: installing it
+# into a profile (
+#
+#   dsh plugin --profile <name> add ./dsh-web-auth
+#
+# ) appends the package to `dsh.profile.bundles`, and the profile boot merges
+# this patch — a single `insert` of the plugin row — like any bundle layer.
+# The row's `inject` makes the Loader start the webServer service first, so
+# the auth gate wraps the HTTP listener after it is bound.
+#
+# The package also declares `dsh.client` (see package.json), so the web app
+# loads the browser half (the settings section card) automatically.
+#
+# There is intentionally NO password here: passwords are maintained through
+# the GUI (login page first setup / settings card change), stored hashed
+# under $DSH_HOME/web-auth/. Until a password is set, auth stays disabled
+# (see the README for the warning this prints at boot).
+- insert:
+    - id: web-auth
+      name: '@fonlan/dsh-web-auth'
+      inject: [webServer]
