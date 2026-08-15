@@ -9,11 +9,11 @@
  */
 import { build } from 'esbuild'
 import { readFile, rm, writeFile } from 'node:fs/promises'
-import { rmSync } from 'node:fs'
+import { rmSync, readFileSync } from 'node:fs'
 
 const TMP = 'lib/.client-bundle.js'
 const OUT = 'lib/client.js'
-const ID = 'dsh-web-auth'
+const ID = JSON.parse(readFileSync('package.json', 'utf8')).name
 
 await build({
   entryPoints: ['src/client/index.tsx'],
