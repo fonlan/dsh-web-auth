@@ -31,6 +31,7 @@ import {
   writeWebserverHostPatch,
   type ListenHost
 } from './profile-patch.ts'
+import { installWebAuthSettings } from './settings.ts'
 import type { PluginContext } from './context-types.ts'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
@@ -73,6 +74,12 @@ export function apply(ctx: PluginContext): void {
     // away; failures are logged, never thrown — the client was confirmed.
     listen: buildListenController(ctx)
   }
+
+  // The plugin's own Settings Card (设置 → 插件配置 → web-auth) rides the
+  // `web-auth` settings namespace: registering it makes the tab dispatch the
+  // card, and committed listenHost changes are applied here. Attaches only
+  // when a settings service exists (CLI/headless profiles skip it).
+  installWebAuthSettings(ctx, env.listen)
 
   if (state.readHash() === undefined) {
     // console.error, not ctx.logger.warn: the cordis default logger level

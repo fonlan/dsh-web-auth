@@ -36,4 +36,14 @@ export interface PluginContext {
    * boot anchors on — the loader inherits it down the whole tree).
    */
   baseUrl: string
+  /**
+   * Attach a callback when listed services are ready (cordis registry,
+   * mixed onto every context). Used to attach the settings namespace
+   * opportunistically: the callback only runs where a settings service
+   * exists (web profiles), so CLI/headless profiles skip it.
+   */
+  inject(
+    deps: string[],
+    callback: (sctx: PluginContext) => void
+  ): unknown
 }

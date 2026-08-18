@@ -11,7 +11,10 @@
 # the auth gate wraps the HTTP listener after it is bound.
 #
 # The package also declares `dsh.client` (see package.json), so the web app
-# loads the browser half (the settings section card) automatically.
+# loads the browser half (the plugin's own Settings Card) automatically. The
+# card registers on the `settings.plugin.item` slot keyed by the `web-auth`
+# settings namespace (see src/settings.ts) — the 设置 → 插件 → 插件配置 tab
+# pairs the two.
 #
 # There is intentionally NO password here: passwords are maintained through
 # the GUI (login page first setup / settings card change), stored hashed
