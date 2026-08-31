@@ -17,7 +17,6 @@
  * prepare → deferred-commit path the REST API used before.
  */
 import z from '@deepseek-ai/schemastery'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import {
   isAllowedListenHost,
   type ListenHost
@@ -28,7 +27,7 @@ import type { ListenController } from './handlers.ts'
 export const WEB_AUTH_NS = 'web-auth'
 
 /** Branded namespace for the settings provider. */
-export const NS = settingsNamespace(WEB_AUTH_NS)
+export const NS = WEB_AUTH_NS
 
 /** The namespace's resolved shape. */
 export interface WebAuthSettings {

@@ -45,7 +45,7 @@ interface Slots {
   register(def: SlotEntry, component: unknown): unknown
 }
 
-/** Client settings scope face (subset of @deepseek-ai/dsh-client-runtime). */
+/** Client settings scope face (subset of the app client modules). */
 interface SettingsScopeFace {
   getSnapshot(): {
     status: 'loading' | 'ready' | 'unavailable'
