@@ -41,6 +41,14 @@ export interface HandlerEnv {
   limiter: RateLimiter
   now?: () => number
   /**
+   * Mint DSH's own browser-session cookie (the one dsh-client-connection
+   * validates against the process launch token) server-side, returning the
+   * raw Set-Cookie value to relay to the user's browser, or undefined when
+   * the exchange cannot run (no connection service, unreachable loopback,
+   * fetch failure). See buildDshCookieMinter in index.ts.
+   */
+  mintDshCookie?(): Promise<string | undefined>
+  /**
    * Loopback authority ("127.0.0.1:<port>") used to rewrite the Host/Origin
    * of AUTHENTICATED requests (any path prefix).
    * The /api gateway pins its privileged methods (settings.*, credentials.*,
@@ -183,13 +191,15 @@ export function setSessionCookie(res: ServerResponse, secret: Buffer, now: numbe
     'Max-Age=' + String(SESSION_TTL_SECONDS)
   ]
   if (secure) parts.push('Secure')
-  res.setHeader('set-cookie', parts.join('; '))
+  // appendHeader (not setHeader): the gate may have already attached the
+  // DSH cookie to this response — a setHeader would silently drop it.
+  res.appendHeader('set-cookie', parts.join('; '))
 }
 
 function clearCookie(res: ServerResponse, secure: boolean): void {
   const parts = [COOKIE_NAME + '=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0']
   if (secure) parts.push('Secure')
-  res.setHeader('set-cookie', parts.join('; '))
+  res.appendHeader('set-cookie', parts.join('; '))
 }
 
 // ── the gate ────────────────────────────────────────────────────────────────
@@ -197,6 +207,19 @@ function clearCookie(res: ServerResponse, secure: boolean): void {
 export interface Gate {
   allow(req: IncomingMessage, res: ServerResponse): boolean
   allowUpgrade(req: IncomingMessage): boolean
+  passed?(req: IncomingMessage, res: ServerResponse): void | Promise<void>
+}
+
+/** Minimum interval between server-side DSH cookie mints (debounce). */
+const DSH_MINT_DEBOUNCE_MS = 1000
+
+/** Number of `token` query parameters in the request URL. */
+export function tokenQueryCount(req: IncomingMessage): number {
+  try {
+    return new URL(req.url ?? '/', 'http://x').searchParams.getAll('token').length
+  } catch {
+    return 0
+  }
 }
 
 /**
@@ -208,6 +231,8 @@ export interface Gate {
  */
 export function createGate(env: HandlerEnv): Gate {
   const now = env.now ?? Date.now
+  /** Last server-side DSH cookie mint attempt (epoch ms). */
+  let lastMintAt = 0
   const whitelisted = (method: string, pathname: string): boolean => {
     if (pathname === '/login') return method === 'GET' || method === 'HEAD' || method === 'POST'
     if (pathname === '/logout') return method === 'GET' || method === 'POST'
@@ -216,6 +241,30 @@ export function createGate(env: HandlerEnv): Gate {
 
   const sessionOf = (req: IncomingMessage): ReturnType<typeof verifySession> =>
     verifySession(cookieValue(req.headers.cookie, COOKIE_NAME), env.state.secret, now())
+
+  /**
+   * Mint DSH's browser-session cookie and attach it to the response when due
+   * (debounced globally, ~1/s — the mint is one cheap loopback exchange).
+   * Runs for ANY allowed request, authenticated or not: the minted DSH
+   * cookie alone never opens the gate (every other path still requires the
+   * plugin session), and minting early (login page, setup redirect) means a
+   * fresh browser carries both cookies by the time it first reaches DSH.
+   */
+  const maybeMintDshCookie = async (res: ServerResponse): Promise<void> => {
+    const mint = env.mintDshCookie
+    if (mint === undefined) return
+    const t = now()
+    if (t - lastMintAt < DSH_MINT_DEBOUNCE_MS) return
+    lastMintAt = t
+    try {
+      const cookie = await mint()
+      if (cookie !== undefined && !res.headersSent) {
+        res.appendHeader('set-cookie', cookie)
+      }
+    } catch (error) {
+      console.error('[dsh-web-auth] DSH cookie mint failed:', error)
+    }
+  }
 
   /**
    * Present AUTHENTICATED traffic as loopback to every downstream
@@ -249,6 +298,19 @@ export function createGate(env: HandlerEnv): Gate {
       const pathname = pathnameOf(req)
       const method = req.method ?? 'GET'
       if (whitelisted(method, pathname)) return true
+      // DSH launch-token exchange: GET / with a `token` query param is DSH's
+      // own bootstrap surface (the URL printed at startup). DSH validates the
+      // token itself and either mints its browser-session cookie (303 → clean
+      // /) or answers its own 401. Let it through WITHOUT a plugin session —
+      // the minted cookie alone cannot open the gate (every other path still
+      // demands the session) — but still present it as loopback, so the
+      // cookie DSH mints binds to the same authority every authenticated
+      // request uses after the rewrite. This is also how the server-side
+      // mint (mintDshCookie) re-enters the server.
+      if (method === 'GET' && pathname === '/' && tokenQueryCount(req) > 0) {
+        rewriteAsLoopback(req)
+        return true
+      }
       const session = sessionOf(req)
       if (session !== undefined) {
         if (needsSessionRefresh(session, now())) {
@@ -269,6 +331,9 @@ export function createGate(env: HandlerEnv): Gate {
       if (sessionOf(req) === undefined) return false
       rewriteAsLoopback(req)
       return true
+    },
+    async passed(req, res) {
+      await maybeMintDshCookie(res)
     }
   }
 }

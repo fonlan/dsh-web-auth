@@ -42,6 +42,8 @@ dsh plugin --profile web update @fonlan/dsh-web-auth
 |---|---|
 | 未登录访问页面（GET/HEAD） | `302` → `/login?next=原路径`，登录后跳回 |
 | 未登录访问 API（POST 等） | `401` JSON |
+| DSH 启动令牌交换（`GET /?token=…`） | 放行并改写为回环来源转发：DSH 自行校验令牌、签发自己的 `dsh-auth` cookie（`303` → 干净 `/`）；令牌无效则收到 DSH 自带的 `401` |
+| DSH 会话 cookie 自动签发 | 插件在放行响应上**服务端代理 DSH 的令牌交换**（走本机回环 `/?token=`），把 `dsh-auth` Set-Cookie 随响应转发给浏览器——新浏览器无需再手工打开打印的 token URL；每分钟最多一次（结果会持续续期 DSH 的 30 天 cookie） |
 | 反代域名下已登录访问任意路径（含 `/api`、插件前缀） | 改写为回环来源放行，网关特权方法与插件围栏不再 403 |
 | 跨站请求（即使带 Cookie） | 仍被围栏 `403` 拒绝 |
 | 未登录 WebSocket 升级 | 握手直接 `401` 拒绝 |
@@ -51,6 +53,8 @@ dsh plugin --profile web update @fonlan/dsh-web-auth
 | 修改密码 | 校验旧密码 → 轮换签名密钥 → **全员下线**，跳转登录页 |
 | 切换监听地址（设置卡片） | 校验取值（仅 `127.0.0.1` / `0.0.0.0`）→ 写入 `web-auth` settings 命名空间（revision 设栅）→ host 半区应用 patch（profile 优先，home 兜底）→ HMR 热重载 webserver 重新绑定；**WebSocket 短暂断连后自动重连** |
 | `/logout` | 清除 Cookie，跳转登录页 |
+
+> **无需再处理 DSH 自己的启动令牌**：DSH 的浏览器会话认证（`dsh web` 启动时打印的 `http://127.0.0.1:3080/?token=…`）用 cookie 绑定 Host。插件会把所有已认证请求的 Host 改写为回环地址，而 DSH 的 cookie 必须与「DSH 看到的 Host」一致——`0.1.5` 起插件会在登录/会话期间**自动在服务端完成 DSH 令牌交换**并把 `dsh-auth` cookie 转交给浏览器（含持续续期），所以外部设备、新浏览器都不需要再手工访问带 token 的 URL。唯一的例外：旧版本插件（< 0.1.5）签发的 cookie 过期后，需要手动以 `https://<域名>/?token=<dsh web 启动打印的令牌>` 打开一次完成引导。
 
 ### 切换监听地址
 

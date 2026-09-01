@@ -38,6 +38,8 @@ interface Harness {
   request(path: string, init?: RequestInit & { headers?: Record<string, string> }): Promise<Response>
   cookieOf(response: Response): string | undefined
   login(password: string, extraHeaders?: Record<string, string>): Promise<string | undefined>
+  /** Register a route like the dsh webserver dispatcher (index/token tests). */
+  route(path: string, handler: (req: IncomingMessage, res: ServerResponse) => void): void
 }
 
 /**
@@ -242,6 +244,9 @@ function createHarness(
       const cookie = harness.cookieOf(r)
       await r.arrayBuffer()
       return cookie
+    },
+    route(path, handler) {
+      routes.set(path, handler)
     }
   }
   return harness
@@ -321,6 +326,194 @@ describe('gate: unauthenticated access', () => {
     assert.match(html, /访问认证/)
     assert.equal(page.headers.get('content-security-policy')?.includes("form-action 'self'"), true)
     assert.equal(page.headers.get('cache-control'), 'no-store')
+    await h.close()
+  })
+})
+
+describe('gate: dsh launch-token exchange', () => {
+  it('forwards GET /?token= without a session and rewrites Host to loopback', async () => {
+    const h = createHarness(true)
+    h.route('/', (req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('host:' + String(req.headers.host))
+    })
+    const r = await h.request('/?token=some-launch-token')
+    assert.equal(r.status, 200)
+    assert.equal(await r.text(), 'host:127.0.0.1:' + h.port)
+    await h.close()
+  })
+
+  it('forwards GET /?token= with a valid session too (still loopback)', async () => {
+    const h = createHarness(true)
+    h.route('/', (req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('host:' + String(req.headers.host))
+    })
+    const cookie = await h.login(PASSWORD)
+    assert.ok(cookie)
+    const r = await h.request('/?token=some-launch-token', { headers: cookieHeader(cookie) })
+    assert.equal(r.status, 200)
+    assert.equal(await r.text(), 'host:127.0.0.1:' + h.port)
+    await h.close()
+  })
+
+  it('still rejects non-GET token URLs without a session', async () => {
+    const h = createHarness(true)
+    const r = await h.request('/?token=some-launch-token', { method: 'POST', body: '{}' })
+    assert.equal(r.status, 401)
+    assert.deepEqual(await r.json(), { error: 'unauthorized' })
+    await h.close()
+  })
+
+  it('keeps redirecting token-less GET / to /login', async () => {
+    const h = createHarness(true)
+    const r = await h.request('/')
+    assert.equal(r.status, 302)
+    assert.equal(r.headers.get('location'), '/login?next=%2F')
+    await r.arrayBuffer()
+    await h.close()
+  })
+})
+
+describe('gate: server-side DSH cookie mint', () => {
+  const DSH_COOKIE = 'dsh-auth-test=v1.fake; Max-Age=60; Path=/; HttpOnly; SameSite=Strict'
+
+  it('mints and relays the DSH cookie on the login page (fresh browser bootstrap)', async () => {
+    const h = createHarness(true)
+    let calls = 0
+    h.env.mintDshCookie = async () => {
+      calls++
+      return DSH_COOKIE
+    }
+    const page = await h.request('/login')
+    assert.equal(page.status, 200)
+    assert.equal(calls, 1)
+    assert.ok(page.headers.getSetCookie().some((c) => c.startsWith('dsh-auth-test=')))
+    await page.text()
+    await h.close()
+  })
+
+  it('mints on every allowed request at most once per second (debounce)', async () => {
+    const h = createHarness(true)
+    let calls = 0
+    h.env.mintDshCookie = async () => {
+      calls++
+      return DSH_COOKIE
+    }
+    const page = await h.request('/login')
+    assert.equal(page.status, 200)
+    assert.equal(calls, 1)
+    await page.text()
+
+    // Within the debounce window: no second mint.
+    const again = await h.request('/login')
+    assert.equal(again.status, 200)
+    assert.equal(calls, 1)
+    assert.equal(again.headers.getSetCookie().length, 0)
+    await again.text()
+
+    // Past the debounce: the next allowed request mints again (self-heal).
+    h.advance(1001)
+    const healed = await h.request('/login')
+    assert.equal(healed.status, 200)
+    assert.equal(calls, 2)
+    assert.ok(healed.headers.getSetCookie().some((c) => c.startsWith('dsh-auth-test=')))
+    await healed.text()
+    await h.close()
+  })
+
+  it('attaches the minted DSH cookie to authenticated traffic (lost-cookie self-heal)', async () => {
+    const h = createHarness(true)
+    // Login first WITHOUT a minter so login() returns the plugin session
+    // cookie (with a minter, getSetCookie would hold the DSH cookie first).
+    const cookie = await h.login(PASSWORD)
+    assert.ok(cookie)
+    let calls = 0
+    h.env.mintDshCookie = async () => {
+      calls++
+      return DSH_COOKIE
+    }
+    const r = await h.request('/', { headers: cookieHeader(cookie) })
+    assert.equal(r.status, 200)
+    assert.equal(calls, 1)
+    assert.ok(r.headers.getSetCookie().some((c) => c.startsWith('dsh-auth-test=')))
+    await r.text()
+    await h.close()
+  })
+
+  it('never blocks dispatch when the mint throws', async () => {
+    const h = createHarness(true)
+    const cookie = await h.login(PASSWORD)
+    assert.ok(cookie)
+    h.env.mintDshCookie = async () => {
+      throw new Error('mint exploded')
+    }
+    const page = await h.request('/login')
+    assert.equal(page.status, 200)
+    await page.text()
+
+    const r = await h.request('/', { headers: cookieHeader(cookie) })
+    assert.equal(r.status, 200)
+    assert.equal(await r.text(), 'fallback:/')
+    await h.close()
+  })
+
+  it('full loop: mint re-enters DSH-shaped token exchange and relays its cookie', async () => {
+    const h = createHarness(true)
+    // DSH-shaped index: a valid `?token=` mints the browser-session cookie
+    // (303 → clean /), like dsh-client-connection authorizeIndex does.
+    const LAUNCH = 'launch-token-for-test'
+    const MINTED = 'dsh-auth-minted=v1; Max-Age=60; Path=/; HttpOnly; SameSite=Strict'
+    h.route('/', (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://x')
+      const tokens = url.searchParams.getAll('token')
+      if (req.method === 'GET' && url.pathname === '/' && tokens.length === 1 && tokens[0] === LAUNCH) {
+        res.writeHead(303, { location: '/', 'set-cookie': MINTED })
+        res.end()
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('index:' + String(req.headers.host))
+    })
+    // The minter wired exactly like buildDshCookieMinter: fetch the token
+    // URL with redirect:manual, surface the DSH Set-Cookie value.
+    h.env.mintDshCookie = async () => {
+      const r = await fetch(h.base + '/?token=' + LAUNCH, { redirect: 'manual' })
+      const cookies = r.headers.getSetCookie?.() ?? []
+      return cookies.find((c) => c.startsWith('dsh-auth-')) ?? cookies[0]
+    }
+    // Fresh browser: GET / without session → /login; the login page mint
+    // runs the exchange and relays the DSH cookie.
+    const page = await h.request('/login')
+    assert.equal(page.status, 200)
+    assert.ok(page.headers.getSetCookie().some((c) => c.startsWith('dsh-auth-minted=')))
+    await page.text()
+
+    // Simulate a browser that loads / directly with only the plugin session
+    // (no DSH cookie yet): gate passes, mint attaches the DSH cookie, and
+    // the DSH-shaped index is served (both cookies present in the jar).
+    // Past the debounce window (a real user needs >1s to type the password),
+    // the login POST mint runs again and its 302 carries BOTH cookies.
+    h.advance(1001)
+    const { jar, setCookie } = await (async () => {
+      const login = await h.request('/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'password=' + encodeURIComponent(PASSWORD) + '&next=%2F'
+      })
+      const setCookies = login.headers.getSetCookie()
+      await login.arrayBuffer()
+      const session = setCookies.find((c) => c.startsWith('dsh_web_auth='))
+      assert.ok(session)
+      const dsh = setCookies.find((c) => c.startsWith('dsh-auth-minted='))
+      assert.ok(dsh)
+      return { jar: session.split(';')[0] + '; ' + dsh.split(';')[0], setCookie: login }
+    })()
+    // The login response itself carries BOTH cookies (works through a proxy).
+    assert.ok(setCookie)
+    const index = await h.request('/', { headers: { cookie: jar } })
+    assert.equal(index.status, 200)
+    assert.equal(await index.text(), 'index:127.0.0.1:' + h.port)
     await h.close()
   })
 })

@@ -19,8 +19,13 @@ import type { Duplex } from 'node:stream'
 export interface GateHandlers {
   /** Decide whether one request may proceed; false = gate answers it. */
   allow(req: IncomingMessage, res: ServerResponse): boolean
-  /** Hook after an allowed request (cookie refresh). */
-  passed?(req: IncomingMessage, res: ServerResponse): void
+  /**
+   * Hook after an allowed request (cookie refresh / DSH cookie mint).
+   * May be async: the gate awaits it BEFORE forwarding, so response
+   * headers it appends reach the client; it must never throw, and a
+   * rejection must not prevent the downstream dispatch.
+   */
+  passed?(req: IncomingMessage, res: ServerResponse): void | Promise<void>
   /** Decide whether one WebSocket upgrade may proceed. */
   allowUpgrade(req: IncomingMessage): boolean
 }
@@ -53,9 +58,14 @@ export function installGate(server: Server, handlers: GateHandlers): () => void 
   server.removeAllListeners('request')
   server.removeAllListeners('upgrade')
 
-  server.on('request', (req: IncomingMessage, res: ServerResponse) => {
+  server.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     if (!handlers.allow(req, res)) return
-    handlers.passed?.(req, res)
+    try {
+      await handlers.passed?.(req, res)
+    } catch {
+      // A failing passed() hook must never block the downstream dispatch
+      // (response headers it could not attach are a soft failure).
+    }
     for (const listener of requestListeners) {
       ;(listener as (req: IncomingMessage, res: ServerResponse) => void)(req, res)
     }

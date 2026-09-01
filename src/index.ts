@@ -60,6 +60,12 @@ export function apply(ctx: PluginContext): void {
   const env = {
     state,
     limiter: new RateLimiter(),
+    // Server-side mint of DSH's own browser-session cookie: relayed to the
+    // browser on allowed responses so DSH's launch-token auth no longer
+    // requires opening the printed ?token= URL per browser. Bound lazily —
+    // a headless/CLI profile without the connection service simply never
+    // mints (each request then fails DSH auth silently, as before).
+    mintDshCookie: buildDshCookieMinter(ctx),
     // Authenticated /api requests are presented to the gateway's trust fence
     // as loopback, so the privileged-method pinning (settings.*, credentials.*,
     // discoverModels, …) passes through the reverse proxy. See handlers.ts.
@@ -150,6 +156,51 @@ export function apply(ctx: PluginContext): void {
   ]
   for (const route of routes) {
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: route.path, handler: route.handler }), `web-auth: ${route.path} route`)
+  }
+}
+
+/**
+ * Server-side DSH browser-session cookie mint.
+ *
+ * dsh-client-connection exposes the process launch-token URL through its
+ * `connection` service (authenticatedUrl — the same call dsh-web-app uses to
+ * print the startup URL). This minter fetches that URL over the server's own
+ * loopback: the gate's token-exchange branch forwards it (still rewriting
+ * Host to loopback), DSH validates the token and answers a 303 with the
+ * signed `dsh-auth-<sha256(loopback)>` cookie — exactly the cookie every
+ * authenticated request needs after the Host rewrite. The Set-Cookie value is
+ * returned so the gate can relay it to the user's browser on ordinary
+ * responses, meaning new browsers/endpoints no longer need the printed token
+ * (and DSH's 30-day cookie is refreshed continuously).
+ *
+ * Returns undefined when the exchange cannot run (no connection service,
+ * non-loopback-only bind, fetch failure) — the caller degrades to the old
+ * behavior where the cookie must arrive via the printed token URL.
+ */
+function buildDshCookieMinter(ctx: PluginContext): () => Promise<string | undefined> {
+  let connection: { authenticatedUrl(baseUrl: string): string } | undefined
+  ctx.inject(['connection'], (cctx) => {
+    connection = (cctx as unknown as {
+      connection?: { authenticatedUrl(baseUrl: string): string }
+    }).connection
+  })
+  return async () => {
+    if (connection === undefined) return undefined
+    const host = ctx.webServer.host === '0.0.0.0' || ctx.webServer.host === '::' ? '127.0.0.1' : ctx.webServer.host
+    try {
+      const url = connection.authenticatedUrl(`http://${host}:${String(ctx.webServer.port)}`)
+      const response = await fetch(url, { redirect: 'manual' })
+      const cookies = response.headers.getSetCookie?.() ?? []
+      const all = cookies.length > 0
+        ? cookies
+        : (response.headers.get('set-cookie') ?? '').length > 0
+          ? [response.headers.get('set-cookie') ?? '']
+          : []
+      return all.find((cookie) => cookie.startsWith('dsh-auth-')) ?? all[0]
+    } catch (error) {
+      console.error('[dsh-web-auth] could not mint DSH browser-session cookie:', error instanceof Error ? error.message : String(error))
+      return undefined
+    }
   }
 }
 
