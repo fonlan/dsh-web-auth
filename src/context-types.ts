@@ -10,8 +10,12 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 export interface WebServerService {
   /** The underlying node:http server (gated by wrapping its listeners). */
   server: Server
-  /** The listening port (the OS-assigned value when config.port is 0). */
-  port: number
+  /**
+   * The bound listening port (the OS-assigned value when config.port is 0).
+   * Undefined until the socket is bound, which happens concurrently with
+   * plugin loading — read it per request, never capture it at apply time.
+   */
+  port?: number
   /** The configured bind host ('127.0.0.1' or '0.0.0.0'). */
   host: string
   /** Register an exact-path route; returns the disposer. */
@@ -20,6 +24,12 @@ export interface WebServerService {
     path: string
     handler: (req: IncomingMessage, res: ServerResponse) => void
   }): () => void
+  /**
+   * Register a raw-HTML index transform over the boot page render (applied
+   * after the structured injection rows, in registration order); returns
+   * the disposer removing it.
+   */
+  tapIndex(transform: (html: string) => string): () => void
 }
 
 /** The plugin context members this plugin consumes. */

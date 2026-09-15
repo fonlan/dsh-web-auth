@@ -10,6 +10,11 @@
  * state.ts. Until a password is configured the gate is OPEN and a boot
  * warning is logged; the login page then offers first-password setup.
  *
+ * Opt-in composition config (`unlockRemoteSettings`, Config schema below)
+ * injects the `__DSH_TRANSPORT__.ownsHost` flag into the served boot page
+ * (webServer.tapIndex) so pages reached through a reverse proxy/domain can
+ * load the host settings document — see remote-unlock.ts.
+ *
  * Install (bundle layer):  dsh plugin --profile web add ./dsh-web-auth
  */
 import { installGate } from './gate.ts'
@@ -32,20 +37,42 @@ import {
   type ListenHost
 } from './profile-patch.ts'
 import { installWebAuthSettings } from './settings.ts'
+import { injectOwnsHost } from './remote-unlock.ts'
 import type { PluginContext } from './context-types.ts'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
+import z from '@deepseek-ai/schemastery'
 
 /** Stable Cordis plugin name. */
 export const name = 'web-auth'
 /** Services required before the gate can be installed. */
 export const inject = ['webServer']
 
+/** The plugin's composition config (patch-layer `config:` overrides). */
+export interface WebAuthConfig {
+  /**
+   * Inject the `__DSH_TRANSPORT__.ownsHost` flag into the served boot page
+   * so pages reached through a reverse proxy/domain load the host settings
+   * document and the settings plane works remotely. Default off: the flag
+   * is a dsh security boundary, and turning it over lets every
+   * session-authenticated browser read and write the host settings document
+   * from wherever the domain is reachable. See remote-unlock.ts.
+   */
+  unlockRemoteSettings: boolean
+}
+
+/** Schema resolving the composition config (cordis Standard-Schema path). */
+export const Config: z<WebAuthConfig> = z.object({
+  unlockRemoteSettings: z.boolean().default(false)
+})
+
 /**
  * Mount the auth gate and its routes.
  * @param ctx - plugin context carrying the webServer service (listening).
+ * @param config - validated composition config (Config schema defaults when
+ *   the patch row spells none).
  */
-export function apply(ctx: PluginContext): void {
+export function apply(ctx: PluginContext, config: WebAuthConfig): void {
   const dshHome = resolveDshHome()
   const state = {
     secret: readSecret(dshHome),
@@ -69,7 +96,17 @@ export function apply(ctx: PluginContext): void {
     // Authenticated /api requests are presented to the gateway's trust fence
     // as loopback, so the privileged-method pinning (settings.*, credentials.*,
     // discoverModels, …) passes through the reverse proxy. See handlers.ts.
-    loopbackAuthority: '127.0.0.1:' + String(ctx.webServer.port),
+    // Read per request, never captured: `webServer.port` is the *bound* port
+    // and plugins load concurrently with the webserver's bind, so it is still
+    // unassigned while this plugin applies (evaluating it here would freeze
+    // the authority into an unparseable "127.0.0.1:undefined" that every
+    // downstream fence then rejects). No port yet means no rewrite — the
+    // request's own Host is already a valid authority, which is also how a
+    // profile whose webserver is not listening at all stays consistent.
+    get loopbackAuthority(): string | undefined {
+      const port = ctx.webServer.port
+      return port === undefined ? undefined : '127.0.0.1:' + String(port)
+    },
     // Live listen-host switching: the webserver's bind host is composition
     // config owned by the profile patch layer (or the home patch when it
     // spells the webserver row), so the change is written there and the HMR
@@ -110,6 +147,13 @@ export function apply(ctx: PluginContext): void {
   ctx.effect(() => {
     return () => disposeGate?.()
   }, 'web-auth: auth gate')
+
+  // ── remote settings unlock (opt-in): inject ownsHost into the boot page ───
+  // A config-only patch change restarts this fiber (cordis update →
+  // dispose + re-apply), so the tap flips live with the composition.
+  if (config.unlockRemoteSettings) {
+    ctx.effect(() => ctx.webServer.tapIndex(injectOwnsHost), 'web-auth: remote settings unlock tap')
+  }
 
   // ── routes (exact table; /api/web-auth/password wins over the /api prefix) ─
   const routes = [
