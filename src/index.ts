@@ -21,6 +21,7 @@ import { installGate } from './gate.ts'
 import { RateLimiter } from './auth-core.ts'
 import { readSecret, readPasswordHash, resolveDshHome, rotateSecret, writePasswordHash } from './state.ts'
 import {
+  MINT_REENTRY_HEADER,
   createGate,
   handleChangePassword,
   handleListenChange,
@@ -233,7 +234,10 @@ function buildDshCookieMinter(ctx: PluginContext): () => Promise<string | undefi
     const host = ctx.webServer.host === '0.0.0.0' || ctx.webServer.host === '::' ? '127.0.0.1' : ctx.webServer.host
     try {
       const url = connection.authenticatedUrl(`http://${host}:${String(ctx.webServer.port)}`)
-      const response = await fetch(url, { redirect: 'manual' })
+      // The marker header is what the gate's token branch keys on to forward
+      // this re-entry without a plugin session; without it the loopback
+      // tokened GET would be redirected to /login like any stale bookmark.
+      const response = await fetch(url, { redirect: 'manual', headers: { [MINT_REENTRY_HEADER]: '1' } })
       const cookies = response.headers.getSetCookie?.() ?? []
       const all = cookies.length > 0
         ? cookies

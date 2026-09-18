@@ -223,6 +223,25 @@ export function tokenQueryCount(req: IncomingMessage): number {
 }
 
 /**
+ * Marker header the server-side mint (buildDshCookieMinter) stamps on its
+ * loopback re-entry, letting the gate distinguish it from a browser that
+ * merely carries a (possibly stale) printed `?token=` URL.
+ */
+export const MINT_REENTRY_HEADER = 'x-dsh-web-auth-mint'
+
+/**
+ * Whether this tokened request is the server-side mint's own loopback
+ * re-entry: the marker header AND a direct loopback TCP peer (not
+ * clientIp's XFF-aware view — a proxied remote client must not pass even
+ * if it forges the header, and the mint never traverses the proxy).
+ */
+function isMintReentry(req: IncomingMessage): boolean {
+  if (req.headers[MINT_REENTRY_HEADER] !== '1') return false
+  const direct = req.socket.remoteAddress ?? ''
+  return direct === '127.0.0.1' || direct === '::1' || direct === '::ffff:127.0.0.1'
+}
+
+/**
  * Build the gate used to wrap the HTTP server listeners. Whitelisted paths
  * (login page/form, logout) pass through; everything else requires a valid
  * session cookie. Page requests (GET/HEAD) are redirected to /login with the
@@ -301,15 +320,26 @@ export function createGate(env: HandlerEnv): Gate {
       // DSH launch-token exchange: GET / with a `token` query param is DSH's
       // own bootstrap surface (the URL printed at startup). DSH validates the
       // token itself and either mints its browser-session cookie (303 → clean
-      // /) or answers its own 401. Let it through WITHOUT a plugin session —
-      // the minted cookie alone cannot open the gate (every other path still
-      // demands the session) — but still present it as loopback, so the
-      // cookie DSH mints binds to the same authority every authenticated
-      // request uses after the rewrite. This is also how the server-side
-      // mint (mintDshCookie) re-enters the server.
+      // /) or answers its own 401. Forward WITHOUT a plugin session only for
+      // the server-side mint's loopback re-entry (marker header + direct
+      // loopback peer, see buildDshCookieMinter) or when the browser already
+      // holds a plugin session — the minted cookie alone cannot open the gate
+      // (every other path still demands the session) — and always present the
+      // forwarded request as loopback, so the cookie DSH mints binds to the
+      // same authority every authenticated request uses after the rewrite.
+      // Any OTHER tokened request is a remote browser with a launch token that
+      // is stale the moment dsh restarts (the token is per-boot); letting it
+      // through renders DSH's raw 401 dead-end page. Redirect to /login
+      // instead: the server-side mint relays a fresh DSH cookie on the login
+      // response, so the post-login / request is already authenticated and
+      // the browser never needs the token itself.
       if (method === 'GET' && pathname === '/' && tokenQueryCount(req) > 0) {
-        rewriteAsLoopback(req)
-        return true
+        if (sessionOf(req) !== undefined || isMintReentry(req)) {
+          rewriteAsLoopback(req)
+          return true
+        }
+        redirect(res, '/login?next=' + encodeURIComponent(sanitizeNext(pathname) ?? '/'))
+        return false
       }
       const session = sessionOf(req)
       if (session !== undefined) {

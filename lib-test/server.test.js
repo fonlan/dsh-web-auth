@@ -287,15 +287,23 @@ describe('gate: unauthenticated access', () => {
     });
 });
 describe('gate: dsh launch-token exchange', () => {
-    it('forwards GET /?token= without a session and rewrites Host to loopback', async () => {
+    it('forwards the mint marker tokened GET without a session and rewrites Host to loopback', async () => {
         const h = createHarness(true);
         h.route('/', (req, res) => {
             res.writeHead(200, { 'content-type': 'text/plain' });
             res.end('host:' + String(req.headers.host));
         });
-        const r = await h.request('/?token=some-launch-token');
+        const r = await h.request('/?token=some-launch-token', { headers: { 'x-dsh-web-auth-mint': '1' } });
         assert.equal(r.status, 200);
         assert.equal(await r.text(), 'host:127.0.0.1:' + h.port);
+        await h.close();
+    });
+    it('redirects a browser tokened GET without a session to /login (token stripped)', async () => {
+        const h = createHarness(true);
+        const r = await h.request('/?token=stale-launch-token');
+        assert.equal(r.status, 302);
+        assert.equal(r.headers.get('location'), '/login?next=%2F');
+        await r.arrayBuffer();
         await h.close();
     });
     it('forwards GET /?token= with a valid session too (still loopback)', async () => {
@@ -420,9 +428,13 @@ describe('gate: server-side DSH cookie mint', () => {
             res.end('index:' + String(req.headers.host));
         });
         // The minter wired exactly like buildDshCookieMinter: fetch the token
-        // URL with redirect:manual, surface the DSH Set-Cookie value.
+        // URL with redirect:manual and the mint re-entry marker, surface the
+        // DSH Set-Cookie value.
         h.env.mintDshCookie = async () => {
-            const r = await fetch(h.base + '/?token=' + LAUNCH, { redirect: 'manual' });
+            const r = await fetch(h.base + '/?token=' + LAUNCH, {
+                redirect: 'manual',
+                headers: { 'x-dsh-web-auth-mint': '1' }
+            });
             const cookies = r.headers.getSetCookie?.() ?? [];
             return cookies.find((c) => c.startsWith('dsh-auth-')) ?? cookies[0];
         };
