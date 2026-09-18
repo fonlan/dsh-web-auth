@@ -12,6 +12,7 @@
 - **反代友好**：Cookie `Secure` 自动跟随 `x-forwarded-proto`；限速信任回环对端的 `X-Forwarded-For`
 - **监听地址切换**：设置卡片可一键把 dsh 的监听地址在 `127.0.0.1`（仅本机）与 `0.0.0.0`（所有网卡 / 局域网可访问）之间切换，热生效、无需重启进程（写入 `web-auth` settings 命名空间 → host 半区应用 patch → HMR 重绑 webserver）
 - **远程设置解锁（可选）**：`unlockRemoteSettings` 组合配置在启动页注入 `__DSH_TRANSPORT__.ownsHost` 标志，让反代域名下的设置面（模型页、插件配置、常规设置等）完整可用，默认关闭（见下文安全权衡）
+- **启动令牌收口**：未登录浏览器带旧 `?token=` 链接访问一律重定向回登录页，只有插件自身的服务端 mint 走回环放行通道——既不需要手工引导，也不会再撞上 DSH 的 `401` 死页面（`0.1.7` 起）
 - 密码以 **scrypt 加盐哈希**存储（`$DSH_HOME/web-auth/password.hash`，0600），永不回显、不落明文配置
 
 ## 安装
@@ -43,7 +44,8 @@ dsh plugin --profile web update @fonlan/dsh-web-auth
 |---|---|
 | 未登录访问页面（GET/HEAD） | `302` → `/login?next=原路径`，登录后跳回 |
 | 未登录访问 API（POST 等） | `401` JSON |
-| DSH 启动令牌交换（`GET /?token=…`） | 放行并改写为回环来源转发：DSH 自行校验令牌、签发自己的 `dsh-auth` cookie（`303` → 干净 `/`）；令牌无效则收到 DSH 自带的 `401` |
+| DSH 启动令牌交换（`GET /?token=…`） | 仅**插件服务端的 mint 重入**（直连回环对端 + 内部标记头）或**已持有插件会话**的请求放行并改写为回环来源转发：DSH 自行校验令牌、签发自己的 `dsh-auth` cookie（`303` → 干净 `/`）；令牌无效则收到 DSH 自带的 `401` |
+| 浏览器直接打开打印的令牌 URL（未登录） | `302` → `/login?next=/`，**丢弃 `token` 参数**：令牌每次启动重新生成，旧书签/旧链接本就无效，放行只会把用户丢到 DSH 的 `401` 页面；登录后服务端 mint 会自动补发有效的 `dsh-auth` cookie |
 | DSH 会话 cookie 自动签发 | 插件在放行响应上**服务端代理 DSH 的令牌交换**（走本机回环 `/?token=`），把 `dsh-auth` Set-Cookie 随响应转发给浏览器——新浏览器无需再手工打开打印的 token URL；每分钟最多一次（结果会持续续期 DSH 的 30 天 cookie） |
 | 反代域名下已登录访问任意路径（含 `/api`、插件前缀） | 改写为回环来源放行，网关特权方法与插件围栏不再 403 |
 | 反代域名下的设置页（模型页等） | 默认报 `settings are unavailable in this browser`——dsh 客户端按页面 hostname 判定"非本机浏览器"，设置镜像保持进程本地。开启 `unlockRemoteSettings` 后启动页注入 `ownsHost`，设置面完整可用（读写仍过密码门 + 回环围栏） |
@@ -56,7 +58,7 @@ dsh plugin --profile web update @fonlan/dsh-web-auth
 | 切换监听地址（设置卡片） | 校验取值（仅 `127.0.0.1` / `0.0.0.0`）→ 写入 `web-auth` settings 命名空间（revision 设栅）→ host 半区应用 patch（profile 优先，home 兜底）→ HMR 热重载 webserver 重新绑定；**WebSocket 短暂断连后自动重连** |
 | `/logout` | 清除 Cookie，跳转登录页 |
 
-> **无需再处理 DSH 自己的启动令牌**：DSH 的浏览器会话认证（`dsh web` 启动时打印的 `http://127.0.0.1:3080/?token=…`）用 cookie 绑定 Host。插件会把所有已认证请求的 Host 改写为回环地址，而 DSH 的 cookie 必须与「DSH 看到的 Host」一致——`0.1.5` 起插件会在登录/会话期间**自动在服务端完成 DSH 令牌交换**并把 `dsh-auth` cookie 转交给浏览器（含持续续期），所以外部设备、新浏览器都不需要再手工访问带 token 的 URL。唯一的例外：旧版本插件（< 0.1.5）签发的 cookie 过期后，需要手动以 `https://<域名>/?token=<dsh web 启动打印的令牌>` 打开一次完成引导。
+> **无需再处理 DSH 自己的启动令牌**：DSH 的浏览器会话认证（`dsh web` 启动时打印的 `http://127.0.0.1:3080/?token=…`）用 cookie 绑定 Host。插件会把所有已认证请求的 Host 改写为回环地址，而 DSH 的 cookie 必须与「DSH 看到的 Host」一致——`0.1.5` 起插件会在登录/会话期间**自动在服务端完成 DSH 令牌交换**并把 `dsh-auth` cookie 转交给浏览器（含持续续期），所以外部设备、新浏览器都不需要再手工访问带 token 的 URL。`0.1.7` 起这条路径进一步收紧：未登录浏览器带 `token` 访问会被重定向到 `/login` 并丢弃该参数（旧令牌在 dsh 重启后即失效，放行只会展示 DSH 自己的 `401` 页面），登录本身就已经完成 mint，不再需要任何手工引导步骤。
 
 ### 切换监听地址
 
