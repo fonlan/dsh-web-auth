@@ -1,16 +1,18 @@
 /**
- * dsh-web-auth — client half: the plugin's own Settings Card.
+ * dsh-web-auth — client half: the plugin's own settings page.
  *
- * Registers into the `settings.plugin.item` slot keyed by the `web-auth`
- * settings namespace (the same string the host half registers), so the card
- * appears inside 设置 → 插件配置, paired with the namespace by the tab.
- * The card shows whether the password gate is configured, changes the
+ * Registers into the "settings.section" list slot with the stable id
+ * "web-auth", so the page owns one entry in the settings sidebar and renders
+ * in the settings panel's content column. The shell draws no page heading, so
+ * the page renders its own header (title + one-line summary) over the body.
+ *
+ * The page shows whether the password gate is configured, changes the
  * password (old + new, via the host's POST /api/web-auth/password — which
  * rotates the signing secret and invalidates every session, including this
  * one), and switches the listen host: the bind host is written through the
  * client settings scope (revision-fenced, one source of truth), the host
  * half applies it to the patch layer, and HMR rebinds the webserver — the
- * card polls /api/web-auth/status until the new host is live.
+ * page polls /api/web-auth/status until the new host is live.
  *
  * Deps resolved from the browser module table: react only. The slots and
  * settingsScope services are reached through the cordis context; types come
@@ -24,19 +26,19 @@ import type { Context } from '@deepseek-ai/cordis'
  * `connection` and `remote` are required by `settingsScope.bind` (it resolves
  * the settings transport and the forwarded-invalidation subscription through
  * `ctx.get`), so the fiber must wait for them — exactly like
- * dsh-client-ui-settings-plugins does for its own cards.
+ * the settings shell does for its own sections.
  */
 export const inject: string[] = ['slots', 'settingsScope', 'connection', 'remote']
 
-/** The settings namespace this card edits (must match the host half). */
+/** The settings namespace this page edits (must match the host half). */
 const WEB_AUTH_NS = 'web-auth'
 
 interface SlotEntry {
   name: string
   id?: string
-  key?: string
   order?: number
   label?: string | (() => string)
+  locale?: string
   inject?: () => unknown
 }
 
@@ -57,39 +59,17 @@ interface SettingsScopeFace {
   unset(field: string): Promise<void>
 }
 
-interface CardProps {
+interface SettingsSectionProps {
   /** The bound `web-auth` settings scope (from the slot entry's inject face). */
   scope: SettingsScopeFace
 }
 
 const CSS = `
-.dwa-card {
-  border: 1px solid var(--dsw-alias-border-l2, #2a3346);
-  background: var(--dsw-alias-bg-layer-3, #0d1017);
-  border-radius: 12px;
-  list-style: none;
-  transition: border-color .16s, background .16s;
-}
-.dwa-card:hover { border-color: var(--dsw-alias-label-dimmed, #4a5468); }
-.dwa-card[data-open] {
-  background: var(--dsw-alias-bg-layer-2, #141a26);
-  border-color: var(--dsw-alias-label-dimmed, #4a5468);
-}
-.dwa-head {
-  appearance: none; width: 100%; font: inherit; color: inherit; text-align: left; cursor: pointer;
-  background: transparent; border: 0; border-radius: 12px;
-  align-items: center; gap: 12px; padding: 14px 16px; display: flex;
-}
-.dwa-head:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #4f8cff); outline-offset: -2px; }
-.dwa-headText { flex-direction: column; flex: 1; gap: 4px; min-width: 0; display: flex; }
-.dwa-title { color: var(--dsw-alias-label-primary, #e6e6e6); font-size: 15px; font-weight: 600; line-height: 1.4; }
-.dwa-sub { color: var(--dsw-alias-label-tertiary, #8b93a7); font-size: 13px; line-height: 1.5; }
-.dwa-chevron {
-  color: var(--dsw-alias-label-tertiary, #8b93a7); flex: none;
-  transition: transform .16s; display: flex; align-items: center; justify-content: center;
-}
-.dwa-chevron[data-open] { transform: rotate(180deg); }
-.dwa-body { border-top: 1px solid var(--dsw-alias-border-l2, #2a3346); margin: 0 16px; padding: 12px 0 8px; display: flex; flex-direction: column; gap: 12px; }
+.dwa-page { display: flex; flex-direction: column; gap: 16px; max-width: 720px; }
+.dwa-page-head { display: flex; flex-direction: column; gap: 6px; }
+.dwa-page-title { color: var(--dsw-alias-label-primary, #e6e6e6); margin: 0; font-size: 15px; font-weight: 600; line-height: 1.4; }
+.dwa-page-sub { color: var(--dsw-alias-label-tertiary, #8b93a7); margin: 0; font-size: 13px; line-height: 1.5; }
+.dwa-body { display: flex; flex-direction: column; gap: 12px; }
 .dwa-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .dwa-status { font-size: 13px; line-height: 1.6; }
 .dwa-status[data-on] { color: var(--dsw-alias-label-primary, #e6e6e6); }
@@ -123,7 +103,7 @@ const CSS = `
 `
 
 function injectStyle(): void {
-  const id = 'dsh-web-auth/card.css'
+  const id = 'dsh-web-auth/settings-section.css'
   if (document.getElementById(id) !== null) return
   const tag = document.createElement('style')
   tag.id = id
@@ -173,7 +153,7 @@ async function fetchStatus(): Promise<{ configured: boolean; host?: ListenHost }
   }
 }
 
-function AuthCard(props: CardProps): JSX.Element | null {
+function WebAuthSettingsSection(props: SettingsSectionProps): JSX.Element | null {
   const { scope } = props
   // Bind the methods: React invokes getSnapshot/subscribe as bare functions,
   // and SettingsScopeController's methods depend on `this`.
@@ -191,8 +171,6 @@ function AuthCard(props: CardProps): JSX.Element | null {
   const [listenPick, setListenPick] = useState<ListenHost>('127.0.0.1')
   const [listenBusy, setListenBusy] = useState(false)
   const [listenMsg, setListenMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
-  // Card-local disclosure: collapsed by default, like the built-in plugin cards.
-  const [open, setOpen] = useState(false)
 
   useEffect(() => {
     let alive = true
@@ -210,7 +188,7 @@ function AuthCard(props: CardProps): JSX.Element | null {
   }, [])
 
   // The namespace is served by the host once the scope is ready. While it is
-  // merely loading, keep the card mounted (the tab already dispatched it);
+  // merely loading, keep the page mounted (the sidebar already dispatched it);
   // if it is unavailable (deployment without the host half), render nothing.
   if (snapshot.status === 'unavailable') return null
 
@@ -270,82 +248,71 @@ function AuthCard(props: CardProps): JSX.Element | null {
   }
 
   return (
-    <div className="dwa-card" data-open={open ? '' : undefined}>
-      <button type="button" className="dwa-head" aria-expanded={open}
-        aria-label={(open ? '收起' : '展开') + '：访问认证'} onClick={() => setOpen(!open)}>
-        <span className="dwa-headText">
-          <span className="dwa-title">访问认证</span>
-          <span className="dwa-sub">Web 访问密码与监听地址</span>
-        </span>
-        <span className="dwa-chevron" data-open={open ? '' : undefined} aria-hidden="true">
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <path d="M3.5 5.25L7 8.75L10.5 5.25" stroke="currentColor" strokeWidth="1.5"
-              strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </span>
-      </button>
-      {open && (
-        <div className="dwa-body">
-          <div className="dwa-row">
-            <p className="dwa-status" data-on={configured ? undefined : ''} data-off={configured ? '' : undefined}>
-              {configured === null ? '加载中…' : configured ? '访问认证：已启用' : '访问认证：未设置密码（当前未启用）'}
-            </p>
-          </div>
-          <p className="dwa-hint">
-            设置后，访问本服务需要输入密码；会话有效期 7 天（活动自动续期）。修改密码会使所有已登录会话立即失效。
+    <div className="dwa-page">
+      <header className="dwa-page-head">
+        <h3 className="dwa-page-title">访问认证</h3>
+        <p className="dwa-page-sub">Web 访问密码与监听地址</p>
+      </header>
+      <div className="dwa-body">
+        <div className="dwa-row">
+          <p className="dwa-status" data-on={configured ? undefined : ''} data-off={configured ? '' : undefined}>
+            {configured === null ? '加载中…' : configured ? '访问认证：已启用' : '访问认证：未设置密码（当前未启用）'}
           </p>
-          <hr className="dwa-divider" />
-          {configured && (
-            <div className="dwa-field">
-              <label className="dwa-label" htmlFor="dwa-old">旧密码</label>
-              <input id="dwa-old" className="dwa-input" type="password" autoComplete="current-password"
-                value={oldPassword} onChange={(e) => setOldPassword(e.target.value)} />
-            </div>
-          )}
-          <div className="dwa-field">
-            <label className="dwa-label" htmlFor="dwa-new">新密码（至少 8 位）</label>
-            <input id="dwa-new" className="dwa-input" type="password" autoComplete="new-password"
-              value={newPassword} onChange={(e) => setNewPassword(e.target.value)} />
-          </div>
-          <div className="dwa-field">
-            <label className="dwa-label" htmlFor="dwa-confirm">确认新密码</label>
-            <input id="dwa-confirm" className="dwa-input" type="password" autoComplete="new-password"
-              value={confirm} onChange={(e) => setConfirm(e.target.value)} />
-          </div>
-          <div className="dwa-actions">
-            <button className="dwa-btn" disabled={busy} onClick={() => void submit()}>修改密码</button>
-            <button className="dwa-btn" data-ghost="" onClick={() => { window.location.href = '/logout' }}>退出登录</button>
-          </div>
-          {message !== null && <p className="dwa-msg" data-kind={message.kind} role="alert">{message.text}</p>}
-          <hr className="dwa-divider" />
-          <div className="dwa-field">
-            <label className="dwa-label" htmlFor="dwa-listen">监听地址</label>
-            <select id="dwa-listen" className="dwa-input" value={listenPick}
-              disabled={listenBusy || host === null || !snapshot.writable}
-              onChange={(e) => setListenPick(e.target.value as ListenHost)}>
-              {LISTEN_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
-            </select>
-          </div>
-          <div className="dwa-actions">
-            <button className="dwa-btn" disabled={listenBusy || host === null || host === listenPick || !snapshot.writable}
-              onClick={() => void applyListen()}>
-              应用监听地址
-            </button>
-          </div>
-          <p className="dwa-hint">
-            切换后 dsh 会立即重新绑定监听端口（WebSocket 短暂断连后自动重连）。注意：若当前通过局域网 IP 访问，切回 127.0.0.1 后只能在本机访问。
-          </p>
-          {listenMsg !== null && <p className="dwa-msg" data-kind={listenMsg.kind} role="alert">{listenMsg.text}</p>}
         </div>
-      )}
+        <p className="dwa-hint">
+          设置后，访问本服务需要输入密码；会话有效期 7 天（活动自动续期）。修改密码会使所有已登录会话立即失效。
+        </p>
+        <hr className="dwa-divider" />
+        {configured && (
+          <div className="dwa-field">
+            <label className="dwa-label" htmlFor="dwa-old">旧密码</label>
+            <input id="dwa-old" className="dwa-input" type="password" autoComplete="current-password"
+              value={oldPassword} onChange={(e) => setOldPassword(e.target.value)} />
+          </div>
+        )}
+        <div className="dwa-field">
+          <label className="dwa-label" htmlFor="dwa-new">新密码（至少 8 位）</label>
+          <input id="dwa-new" className="dwa-input" type="password" autoComplete="new-password"
+            value={newPassword} onChange={(e) => setNewPassword(e.target.value)} />
+        </div>
+        <div className="dwa-field">
+          <label className="dwa-label" htmlFor="dwa-confirm">确认新密码</label>
+          <input id="dwa-confirm" className="dwa-input" type="password" autoComplete="new-password"
+            value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+        </div>
+        <div className="dwa-actions">
+          <button className="dwa-btn" disabled={busy} onClick={() => void submit()}>修改密码</button>
+          <button className="dwa-btn" data-ghost="" onClick={() => { window.location.href = '/logout' }}>退出登录</button>
+        </div>
+        {message !== null && <p className="dwa-msg" data-kind={message.kind} role="alert">{message.text}</p>}
+        <hr className="dwa-divider" />
+        <div className="dwa-field">
+          <label className="dwa-label" htmlFor="dwa-listen">监听地址</label>
+          <select id="dwa-listen" className="dwa-input" value={listenPick}
+            disabled={listenBusy || host === null || !snapshot.writable}
+            onChange={(e) => setListenPick(e.target.value as ListenHost)}>
+            {LISTEN_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </div>
+        <div className="dwa-actions">
+          <button className="dwa-btn" disabled={listenBusy || host === null || host === listenPick || !snapshot.writable}
+            onClick={() => void applyListen()}>
+            应用监听地址
+          </button>
+        </div>
+        <p className="dwa-hint">
+          切换后 dsh 会立即重新绑定监听端口（WebSocket 短暂断连后自动重连）。注意：若当前通过局域网 IP 访问，切回 127.0.0.1 后只能在本机访问。
+        </p>
+        {listenMsg !== null && <p className="dwa-msg" data-kind={listenMsg.kind} role="alert">{listenMsg.text}</p>}
+      </div>
     </div>
   )
 }
 
 /**
- * Client plugin body: register the settings card. The shell's declaration
+ * Client plugin body: register the settings page. The shell's declaration
  * may not be on the ledger yet, so the registration waits via slots.inject.
  * @param ctx - the client cordis context.
  */
@@ -356,14 +323,16 @@ export function apply(ctx: Context): void {
     settingsScope: { bind(spec: { namespace: string }): SettingsScopeFace }
   }
   const scope = services.settingsScope.bind({ namespace: WEB_AUTH_NS })
-  services.slots.inject('settings.plugin.item', () =>
+  services.slots.inject('settings.section', () =>
     services.slots.register(
       {
-        name: 'settings.plugin.item',
-        key: WEB_AUTH_NS,
+        name: 'settings.section',
+        id: 'web-auth',
+        order: 120,
+        label: '访问认证',
         inject: () => ({ scope })
       },
-      AuthCard
+      WebAuthSettingsSection
     )
   )
 }

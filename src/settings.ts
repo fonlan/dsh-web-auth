@@ -1,10 +1,10 @@
 /**
  * dsh-web-auth — the `web-auth` settings namespace.
  *
- * The namespace exists so the plugin's browser half can register its own
- * Settings Card: the settings section ("插件配置" tab) dispatches
- * `settings.plugin.item` for every namespace the Host serves, keyed by the
- * namespace string, and the client registers its card under the same key.
+ * The namespace exists so the plugin's browser half can read and write its
+ * own settings page: the page registers on the `settings.section` slot (the
+ * 「访问认证」 entry in the settings sidebar) and binds this namespace through
+ * the client settings scope, which is the only write path to `listenHost`.
  * The namespace carries the one genuine configuration value the plugin owns:
  * the web server's bind host (`listenHost`). The password is deliberately
  * NOT here — it is a secret stored hashed under `$DSH_HOME/web-auth/` and

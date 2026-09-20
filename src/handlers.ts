@@ -1,7 +1,7 @@
 /**
  * dsh-web-auth — request handlers: the gate decision (whitelist + session
  * check), the /login page + form processing (including first-password setup),
- * /logout, and the JSON change-password API for the settings card.
+ * /logout, and the JSON change-password API for the settings page.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
@@ -64,7 +64,7 @@ export interface HandlerEnv {
   loopbackAuthority?: string
   /**
    * Listen-address controller (bound by the host half when the profile
-   * patch layer is reachable). Absent = the settings card cannot change
+   * patch layer is reachable). Absent = the settings page cannot change
    * the bind host.
    */
   listen?: ListenController
@@ -465,7 +465,7 @@ export function handleLogout(req: IncomingMessage, res: ServerResponse, env: Han
   redirect(res, '/login?loggedOut=1')
 }
 
-// ── GET /api/web-auth/status — settings-card state ─────────────────────────
+// ── GET /api/web-auth/status — settings page state ─────────────────────────
 
 export function handleStatus(req: IncomingMessage, res: ServerResponse, env: HandlerEnv): void {
   const body: { configured: boolean; host?: string } = { configured: env.state.readHash() !== undefined }
@@ -474,7 +474,7 @@ export function handleStatus(req: IncomingMessage, res: ServerResponse, env: Han
   writeJson(res, 200, body)
 }
 
-// ── POST /api/web-auth/password — settings-card change ──────────────────────
+// ── POST /api/web-auth/password — settings page change ──────────────────────
 
 export interface ChangePasswordBody {
   oldPassword?: string
@@ -527,7 +527,7 @@ export async function handleChangePassword(req: IncomingMessage, res: ServerResp
   writeJson(res, 200, { ok: true, sessionsInvalidated: true })
 }
 
-// ── POST /api/web-auth/listen — settings-card bind-host switch ──────────────
+// ── POST /api/web-auth/listen — settings page bind-host switch ──────────────
 
 export interface ListenChangeBody {
   host?: unknown

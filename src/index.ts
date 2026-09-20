@@ -4,7 +4,7 @@
  * Host half: wraps the webserver's HTTP/upgrade listeners so every request
  * (routes, static fallback, WebSocket upgrades) must carry a valid session
  * cookie, serves the /login page (including first-password setup), /logout,
- * and the JSON change-password API used by the settings card (client half).
+ * and the JSON change-password API used by the settings page (client half).
  *
  * State lives under $DSH_HOME/web-auth/ (password.hash, secret) — see
  * state.ts. Until a password is configured the gate is OPEN and a boot
@@ -119,10 +119,10 @@ export function apply(ctx: PluginContext, config: WebAuthConfig): void {
     listen: buildListenController(ctx)
   }
 
-  // The plugin's own Settings Card (设置 → 插件配置 → web-auth) rides the
-  // `web-auth` settings namespace: registering it makes the tab dispatch the
-  // card, and committed listenHost changes are applied here. Attaches only
-  // when a settings service exists (CLI/headless profiles skip it).
+  // The plugin's own settings page (设置 → 侧栏「访问认证」) rides the
+  // `web-auth` settings namespace: binding the namespace is how the page reads
+  // and writes it, and committed listenHost changes are applied here. Attaches
+  // only when a settings service exists (CLI/headless profiles skip it).
   installWebAuthSettings(ctx, env.listen)
 
   if (state.readHash() === undefined) {
