@@ -11,7 +11,7 @@ import { createServer } from 'node:http';
 import { connect } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import { installGate } from '../lib/gate.js';
-import { createGate, handleChangePassword, handleListenChange, handleLoginPage, handleLoginPost, handleLogout, handleStatus } from '../lib/handlers.js';
+import { createGate, dshAuthCookieName, handleChangePassword, handleListenChange, handleLoginPage, handleLoginPost, handleLogout, handleStatus } from '../lib/handlers.js';
 import { RateLimiter, SESSION_TTL_SECONDS, hashPassword } from '../lib/auth-core.js';
 const PASSWORD = 'correct-horse-battery';
 /**
@@ -209,13 +209,27 @@ function createHarness(withPassword, beforeGate, listen) {
             await r.arrayBuffer();
             return cookie;
         },
+        dshCookie() {
+            return dshAuthCookieName('127.0.0.1:' + port) + '=v1.jar';
+        },
+        authHeaders(session) {
+            if (session === undefined)
+                return {};
+            return { cookie: session + '; ' + harness.dshCookie() };
+        },
         route(path, handler) {
             routes.set(path, handler);
         }
     };
     return harness;
 }
-function cookieHeader(cookie) {
+/**
+ * A SESSION-ONLY request: the browser holds the plugin session but not DSH's
+ * authority cookie. Deliberate only in the late-mint tests below — every other
+ * authenticated request uses `harness.authHeaders`, which models the jar a
+ * browser has after login.
+ */
+function sessionOnlyHeader(cookie) {
     return cookie === undefined ? {} : { cookie };
 }
 async function rawUpgrade(port, cookie, host, path = '/api/mux/events') {
@@ -314,7 +328,7 @@ describe('gate: dsh launch-token exchange', () => {
         });
         const cookie = await h.login(PASSWORD);
         assert.ok(cookie);
-        const r = await h.request('/?token=some-launch-token', { headers: cookieHeader(cookie) });
+        const r = await h.request('/?token=some-launch-token', { headers: h.authHeaders(cookie) });
         assert.equal(r.status, 200);
         assert.equal(await r.text(), 'host:127.0.0.1:' + h.port);
         await h.close();
@@ -336,18 +350,25 @@ describe('gate: dsh launch-token exchange', () => {
     });
 });
 describe('gate: server-side DSH cookie mint', () => {
-    const DSH_COOKIE = 'dsh-auth-test=v1.fake; Max-Age=60; Path=/; HttpOnly; SameSite=Strict';
+    /**
+     * The gate's "already carries DSH's cookie" check is name-based and the name
+     * is authority-bound, so the minted value must use the plugin's own scheme —
+     * a differently-named cookie would leave every test in the late-mint path.
+     */
+    const dshName = (h) => dshAuthCookieName('127.0.0.1:' + h.port);
+    /** A minted Set-Cookie value shaped like DSH's own (name plus attributes). */
+    const dshSetCookie = (h, value = 'v1.fake') => dshName(h) + '=' + value + '; Max-Age=60; Path=/; HttpOnly; SameSite=Strict';
     it('mints and relays the DSH cookie on the login page (fresh browser bootstrap)', async () => {
         const h = createHarness(true);
         let calls = 0;
         h.env.mintDshCookie = async () => {
             calls++;
-            return DSH_COOKIE;
+            return dshSetCookie(h);
         };
         const page = await h.request('/login');
         assert.equal(page.status, 200);
         assert.equal(calls, 1);
-        assert.ok(page.headers.getSetCookie().some((c) => c.startsWith('dsh-auth-test=')));
+        assert.ok(page.headers.getSetCookie().some((c) => c.startsWith(dshName(h) + '=')));
         await page.text();
         await h.close();
     });
@@ -356,7 +377,7 @@ describe('gate: server-side DSH cookie mint', () => {
         let calls = 0;
         h.env.mintDshCookie = async () => {
             calls++;
-            return DSH_COOKIE;
+            return dshSetCookie(h);
         };
         const page = await h.request('/login');
         assert.equal(page.status, 200);
@@ -373,11 +394,11 @@ describe('gate: server-side DSH cookie mint', () => {
         const healed = await h.request('/login');
         assert.equal(healed.status, 200);
         assert.equal(calls, 2);
-        assert.ok(healed.headers.getSetCookie().some((c) => c.startsWith('dsh-auth-test=')));
+        assert.ok(healed.headers.getSetCookie().some((c) => c.startsWith(dshName(h) + '=')));
         await healed.text();
         await h.close();
     });
-    it('attaches the minted DSH cookie to authenticated traffic (lost-cookie self-heal)', async () => {
+    it('bounces a session-only browser once with the minted DSH cookie (lost-cookie self-heal)', async () => {
         const h = createHarness(true);
         // Login first WITHOUT a minter so login() returns the plugin session
         // cookie (with a minter, getSetCookie would hold the DSH cookie first).
@@ -386,41 +407,65 @@ describe('gate: server-side DSH cookie mint', () => {
         let calls = 0;
         h.env.mintDshCookie = async () => {
             calls++;
-            return DSH_COOKIE;
+            return dshSetCookie(h);
         };
-        const r = await h.request('/', { headers: cookieHeader(cookie) });
-        assert.equal(r.status, 200);
+        // A session but no DSH cookie is the state DSH answers with its raw 401
+        // dead end ("reopen the URL printed by dsh web"). The gate mints and
+        // bounces through the SAME url once instead, so the browser stores the
+        // cookie and the retry is served.
+        const bounced = await h.request('/', { headers: sessionOnlyHeader(cookie) });
+        assert.equal(bounced.status, 302);
+        assert.equal(bounced.headers.get('location'), '/');
+        assert.equal(bounced.headers.get('cache-control'), 'no-store');
         assert.equal(calls, 1);
-        assert.ok(r.headers.getSetCookie().some((c) => c.startsWith('dsh-auth-test=')));
-        await r.text();
+        const relayed = bounced.headers.getSetCookie().find((c) => c.startsWith(dshName(h) + '='));
+        assert.ok(relayed);
+        await bounced.arrayBuffer();
+        // The browser now holds both cookies: served, and no second mint — the
+        // bounce shares the opportunistic mint's throttle.
+        const retry = await h.request('/', { headers: { cookie: cookie + '; ' + relayed.split(';')[0] } });
+        assert.equal(retry.status, 200);
+        assert.equal(await retry.text(), 'fallback:/');
+        assert.equal(calls, 1);
         await h.close();
     });
-    it('never blocks dispatch when the mint throws', async () => {
+    it('falls back to /login when the mint throws, and never locks the browser out', async () => {
         const h = createHarness(true);
         const cookie = await h.login(PASSWORD);
         assert.ok(cookie);
         h.env.mintDshCookie = async () => {
             throw new Error('mint exploded');
         };
+        // A failing mint never fails the request it was minting for.
         const page = await h.request('/login');
         assert.equal(page.status, 200);
         await page.text();
-        const r = await h.request('/', { headers: cookieHeader(cookie) });
-        assert.equal(r.status, 200);
-        assert.equal(await r.text(), 'fallback:/');
+        // Session-only traffic cannot be served without the cookie, so the gate
+        // sends the browser to /login — that page retries the mint and offers the
+        // password form — rather than letting it reach DSH's raw 401 dead end.
+        const bounced = await h.request('/', { headers: sessionOnlyHeader(cookie) });
+        assert.equal(bounced.status, 302);
+        assert.match(bounced.headers.get('location') ?? '', /^\/login\?next=/);
+        await bounced.arrayBuffer();
+        // One bounce per peer per cooldown: the next request is dispatched as
+        // before, so a broken mint can never lock the browser out of the app.
+        const through = await h.request('/', { headers: sessionOnlyHeader(cookie) });
+        assert.equal(through.status, 200);
+        assert.equal(await through.text(), 'fallback:/');
         await h.close();
     });
     it('full loop: mint re-enters DSH-shaped token exchange and relays its cookie', async () => {
         const h = createHarness(true);
         // DSH-shaped index: a valid `?token=` mints the browser-session cookie
-        // (303 → clean /), like dsh-client-connection authorizeIndex does.
+        // (303 → clean /), like dsh-client-connection authorizeIndex does, under
+        // the authority-bound name every later request is judged by.
         const LAUNCH = 'launch-token-for-test';
-        const MINTED = 'dsh-auth-minted=v1; Max-Age=60; Path=/; HttpOnly; SameSite=Strict';
+        const minted = () => dshSetCookie(h, 'v1');
         h.route('/', (req, res) => {
             const url = new URL(req.url ?? '/', 'http://x');
             const tokens = url.searchParams.getAll('token');
             if (req.method === 'GET' && url.pathname === '/' && tokens.length === 1 && tokens[0] === LAUNCH) {
-                res.writeHead(303, { location: '/', 'set-cookie': MINTED });
+                res.writeHead(303, { location: '/', 'set-cookie': minted() });
                 res.end();
                 return;
             }
@@ -442,13 +487,12 @@ describe('gate: server-side DSH cookie mint', () => {
         // runs the exchange and relays the DSH cookie.
         const page = await h.request('/login');
         assert.equal(page.status, 200);
-        assert.ok(page.headers.getSetCookie().some((c) => c.startsWith('dsh-auth-minted=')));
+        assert.ok(page.headers.getSetCookie().some((c) => c.startsWith(dshName(h) + '=')));
         await page.text();
-        // Simulate a browser that loads / directly with only the plugin session
-        // (no DSH cookie yet): gate passes, mint attaches the DSH cookie, and
-        // the DSH-shaped index is served (both cookies present in the jar).
         // Past the debounce window (a real user needs >1s to type the password),
-        // the login POST mint runs again and its 302 carries BOTH cookies.
+        // the login POST mint runs again, so its 302 carries BOTH cookies — the
+        // jar a real browser then sends. That is what lets the next request sail
+        // past the late-mint check straight to the DSH-shaped index.
         h.advance(1001);
         const { jar, setCookie } = await (async () => {
             const login = await h.request('/login', {
@@ -460,7 +504,7 @@ describe('gate: server-side DSH cookie mint', () => {
             await login.arrayBuffer();
             const session = setCookies.find((c) => c.startsWith('dsh_web_auth='));
             assert.ok(session);
-            const dsh = setCookies.find((c) => c.startsWith('dsh-auth-minted='));
+            const dsh = setCookies.find((c) => c.startsWith(dshName(h) + '='));
             assert.ok(dsh);
             return { jar: session.split(';')[0] + '; ' + dsh.split(';')[0], setCookie: login };
         })();
@@ -469,6 +513,41 @@ describe('gate: server-side DSH cookie mint', () => {
         const index = await h.request('/', { headers: { cookie: jar } });
         assert.equal(index.status, 200);
         assert.equal(await index.text(), 'index:127.0.0.1:' + h.port);
+        await h.close();
+    });
+    it('resolves the DSH cookie onto a session-only WebSocket upgrade', async () => {
+        const h = createHarness(true);
+        const session = await h.login(PASSWORD);
+        assert.ok(session);
+        let calls = 0;
+        h.env.mintDshCookie = async () => {
+            calls++;
+            return dshSetCookie(h, 'v1.upgrade');
+        };
+        const upgradeReq = (cookie) => ({
+            headers: { cookie, host: '127.0.0.1:' + h.port },
+            socket: { remoteAddress: '127.0.0.1' }
+        });
+        const gate = createGate(h.env);
+        // An upgrade has no redirect that could repair a missing cookie, so the
+        // gate must put it on this very request: without that, every upgrade from
+        // a browser holding only the plugin session is refused by the host gate, so
+        // /api/remote.mux fails wholesale (the welcome acknowledgement cannot save).
+        const bare = upgradeReq(session);
+        assert.equal(await gate.allowUpgrade(bare), true);
+        assert.equal(calls, 1);
+        assert.ok(String(bare.headers.cookie).includes(session));
+        assert.ok(String(bare.headers.cookie).includes(dshName(h) + '='));
+        // Already carrying it: allowed without spending a second exchange.
+        const carried = upgradeReq(session + '; ' + dshName(h) + '=v1');
+        assert.equal(await gate.allowUpgrade(carried), true);
+        assert.equal(calls, 1);
+        // No minter configured: the upgrade is still allowed (the host gate is the
+        // authority) and no cookie is fabricated.
+        h.env.mintDshCookie = undefined;
+        const unrepairable = upgradeReq(session);
+        assert.equal(await gate.allowUpgrade(unrepairable), true);
+        assert.equal(String(unrepairable.headers.cookie), session);
         await h.close();
     });
 });
@@ -520,7 +599,7 @@ describe('first-password setup (bootstrap)', () => {
         assert.equal(denied.status, 302);
         await denied.arrayBuffer();
         // With the session → through to the fallback.
-        const allowed = await h.request('/', { headers: cookieHeader(cookie) });
+        const allowed = await h.request('/', { headers: h.authHeaders(cookie) });
         assert.equal(allowed.status, 200);
         assert.equal(await allowed.text(), 'fallback:/');
         await h.close();
@@ -607,13 +686,13 @@ describe('login flow', () => {
         const h = createHarness(true);
         const cookie = await h.login(PASSWORD);
         assert.ok(cookie);
-        const allowed = await h.request('/', { headers: cookieHeader(cookie) });
+        const allowed = await h.request('/', { headers: h.authHeaders(cookie) });
         assert.equal(allowed.status, 200);
         assert.equal(await allowed.text(), 'fallback:/');
         // Age the session to just under the refresh threshold: the next request
         // carries a refreshed Set-Cookie with a full lifetime.
         h.advance((SESSION_TTL_SECONDS - 60) * 1000);
-        const refresh = await h.request('/', { headers: cookieHeader(cookie) });
+        const refresh = await h.request('/', { headers: h.authHeaders(cookie) });
         assert.equal(refresh.status, 200);
         const refreshedCookie = refresh.headers.get('set-cookie');
         assert.match(refreshedCookie ?? '', /Max-Age=604800/);
@@ -621,7 +700,7 @@ describe('login flow', () => {
         // A second request carrying the REFRESHED cookie (what the browser now
         // holds) gets no new Set-Cookie — the session has a full lifetime again.
         const freshValue = (refreshedCookie ?? '').split(';')[0];
-        const noRefresh = await h.request('/', { headers: cookieHeader(freshValue) });
+        const noRefresh = await h.request('/', { headers: h.authHeaders(freshValue) });
         assert.equal(noRefresh.status, 200);
         assert.equal(noRefresh.headers.get('set-cookie'), null);
         await noRefresh.arrayBuffer();
@@ -632,7 +711,7 @@ describe('logout', () => {
     it('clears the cookie and redirects to /login', async () => {
         const h = createHarness(true);
         const cookie = await h.login(PASSWORD);
-        const out = await h.request('/logout', { headers: cookieHeader(cookie) });
+        const out = await h.request('/logout', { headers: h.authHeaders(cookie) });
         assert.equal(out.status, 302);
         assert.equal(out.headers.get('location'), '/login?loggedOut=1');
         assert.match(out.headers.get('set-cookie') ?? '', /Max-Age=0/);
@@ -662,7 +741,7 @@ describe('change password API', () => {
         const cookie = await h.login(PASSWORD);
         const attempt = () => h.request('/api/web-auth/password', {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...cookieHeader(cookie) },
+            headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
             body: JSON.stringify({ oldPassword: 'nope', newPassword: 'new-password-123' })
         });
         for (let i = 0; i < 5; i++) {
@@ -679,13 +758,13 @@ describe('change password API', () => {
         const cookie = await h.login(PASSWORD);
         const r = await h.request('/api/web-auth/password', {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...cookieHeader(cookie) },
+            headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
             body: JSON.stringify({ oldPassword: PASSWORD, newPassword: 'new-password-123' })
         });
         assert.equal(r.status, 200);
         assert.deepEqual(await r.json(), { ok: true, sessionsInvalidated: true });
         // The old session is dead (secret rotated).
-        const denied = await h.request('/', { headers: cookieHeader(cookie) });
+        const denied = await h.request('/', { headers: h.authHeaders(cookie) });
         assert.equal(denied.status, 302);
         await denied.arrayBuffer();
         // The old password no longer works; the new one does.
@@ -711,7 +790,7 @@ describe('change password API', () => {
         const cookie = await h.login(PASSWORD);
         const r = await h.request('/api/web-auth/password', {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...cookieHeader(cookie) },
+            headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
             body: JSON.stringify({ oldPassword: PASSWORD, newPassword: 'short' })
         });
         assert.equal(r.status, 400);
@@ -723,7 +802,7 @@ describe('status API and authenticated upgrades', () => {
     it('reports configuration state to the authenticated settings card', async () => {
         const h = createHarness(true);
         const cookie = await h.login(PASSWORD);
-        const r = await h.request('/api/web-auth/status', { headers: cookieHeader(cookie) });
+        const r = await h.request('/api/web-auth/status', { headers: h.authHeaders(cookie) });
         assert.equal(r.status, 200);
         assert.deepEqual(await r.json(), { configured: true });
         await h.close();
@@ -735,7 +814,7 @@ describe('status API and authenticated upgrades', () => {
             commit: () => { }
         });
         const cookie = await h.login(PASSWORD);
-        const r = await h.request('/api/web-auth/status', { headers: cookieHeader(cookie) });
+        const r = await h.request('/api/web-auth/status', { headers: h.authHeaders(cookie) });
         assert.equal(r.status, 200);
         assert.deepEqual(await r.json(), { configured: true, host: '0.0.0.0' });
         await h.close();
@@ -779,7 +858,7 @@ describe('listen change API', () => {
         for (const host of ['localhost', '10.0.0.5', 42, null, undefined]) {
             const r = await h.request('/api/web-auth/listen', {
                 method: 'POST',
-                headers: { 'content-type': 'application/json', ...cookieHeader(cookie) },
+                headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
                 body: JSON.stringify({ host })
             });
             assert.equal(r.status, 400);
@@ -795,7 +874,7 @@ describe('listen change API', () => {
         const cookie = await h.login(PASSWORD);
         const r = await h.request('/api/web-auth/listen', {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...cookieHeader(cookie) },
+            headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
             body: JSON.stringify({ host: '0.0.0.0' })
         });
         assert.equal(r.status, 501);
@@ -819,7 +898,7 @@ describe('listen change API', () => {
         const cookie = await h.login(PASSWORD);
         const r = await h.request('/api/web-auth/listen', {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...cookieHeader(cookie) },
+            headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
             body: JSON.stringify({ host: '0.0.0.0' })
         });
         assert.equal(r.status, 200);
@@ -829,7 +908,7 @@ describe('listen change API', () => {
             { phase: 'commit', host: '# next patch\n' }
         ]);
         // the controller's own state moved, and status reflects it
-        const status = await h.request('/api/web-auth/status', { headers: cookieHeader(cookie) });
+        const status = await h.request('/api/web-auth/status', { headers: h.authHeaders(cookie) });
         assert.deepEqual(await status.json(), { configured: true, host: '0.0.0.0' });
         await h.close();
     });
@@ -848,7 +927,7 @@ describe('listen change API', () => {
         const cookie = await h.login(PASSWORD);
         const r = await h.request('/api/web-auth/listen', {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...cookieHeader(cookie) },
+            headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
             body: JSON.stringify({ host: '0.0.0.0' })
         });
         assert.equal(r.status, 200);
@@ -870,7 +949,7 @@ describe('listen change API', () => {
         const cookie = await h.login(PASSWORD);
         const r = await h.request('/api/web-auth/listen', {
             method: 'POST',
-            headers: { 'content-type': 'application/json', ...cookieHeader(cookie) },
+            headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
             body: JSON.stringify({ host: '0.0.0.0' })
         });
         assert.equal(r.status, 500);
@@ -920,13 +999,13 @@ describe('reverse proxy (privileged /api fence relaxation)', () => {
         // given. The gate rewrites the request as loopback for the fence, so the
         // loopback-pinned settings.describe still dispatches.
         const rpc = await h.request('/api/settings.describe', {
-            headers: { ...cookieHeader(cookie), host: 'dsh.fonlan.top' }
+            headers: { ...h.authHeaders(cookie), host: 'dsh.fonlan.top' }
         });
         assert.equal(rpc.status, 200);
         assert.equal(await rpc.text(), 'rpc:settings.describe');
         // Same for the ordinary (non-privileged) path and for credentialed calls.
         const cred = await h.request('/api/credentials.describe', {
-            headers: { ...cookieHeader(cookie), host: 'dsh.fonlan.top' }
+            headers: { ...h.authHeaders(cookie), host: 'dsh.fonlan.top' }
         });
         assert.equal(cred.status, 200);
         await cred.arrayBuffer();
@@ -937,7 +1016,7 @@ describe('reverse proxy (privileged /api fence relaxation)', () => {
         const cookie = await h.login(PASSWORD);
         const rpc = await h.request('/api/settings.describe', {
             headers: {
-                ...cookieHeader(cookie),
+                ...h.authHeaders(cookie),
                 host: 'dsh.fonlan.top',
                 'sec-fetch-site': 'cross-site'
             }
@@ -987,7 +1066,7 @@ describe('reverse proxy (privileged /api fence relaxation)', () => {
         // carry a proxy-domain request through.
         const rpc = await h.request('/sidebar/api/fs.tree', {
             method: 'POST',
-            headers: { ...cookieHeader(cookie), host: 'dsh.fonlan.top' }
+            headers: { ...h.authHeaders(cookie), host: 'dsh.fonlan.top' }
         });
         assert.equal(rpc.status, 200);
         assert.equal(await rpc.text(), 'rpc:sidebar:api/fs.tree');
@@ -1018,7 +1097,7 @@ describe('reverse proxy (privileged /api fence relaxation)', () => {
         // it as loopback so an arbitrary fence-mirroring plugin passes.
         const rpc = await h.request('/custom-panel/api/items.list', {
             method: 'POST',
-            headers: { ...cookieHeader(cookie), host: 'dsh.fonlan.top' }
+            headers: { ...h.authHeaders(cookie), host: 'dsh.fonlan.top' }
         });
         assert.equal(rpc.status, 200);
         assert.equal(await rpc.text(), 'rpc:custom-panel:api/items.list');

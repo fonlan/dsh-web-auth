@@ -62,18 +62,79 @@ export interface WebAuthConfig {
   unlockRemoteSettings: boolean
 }
 
-/** Schema resolving the composition config (cordis Standard-Schema path). */
-export const Config: z<WebAuthConfig> = z.object({
-  unlockRemoteSettings: z.boolean().default(false)
+/**
+ * One `volatile()` config field as the loader hands it to `apply()`: a live
+ * handle, not the value it currently holds. Spelled structurally rather than as
+ * cosmokit's `Volatile<T>` — cosmokit is a transitive dependency here, and
+ * importing it would put a second cosmokit/schemastery pair into the emitted
+ * declaration.
+ */
+export interface LiveSettingsField<T> {
+  get(): T
+}
+
+/** Hand-written entry config (profile patch / test fixture): the field is optional. */
+export interface WebAuthConfigInput {
+  unlockRemoteSettings?: boolean | null
+}
+
+/** The resolved entry config `apply()` receives: the field is a live handle. */
+export interface ResolvedWebAuthConfig {
+  unlockRemoteSettings: LiveSettingsField<boolean>
+}
+
+/**
+ * Composition config schema (cordis Standard-Schema path).
+ *
+ * `.volatile()` is REQUIRED here, not cosmetic: dsh >= 0.1.7 derives the
+ * plugin's settings page from this schema, and `dsh-settings` SKIPS an entry
+ * whose schema declares no volatile field (`volatileForm(schema)` is undefined)
+ * while refusing every write to a non-volatile path — so without it this
+ * plugin's page disappears from Settings entirely, whichever page renders it.
+ *
+ * The schema is annotated through the package's own default export with locally
+ * declared type arguments: schemastery >= 3.18.3 carries a third `Mode` type
+ * parameter, so a `volatile()` field's OUTPUT type is `Volatile<T>` and the
+ * old `z<WebAuthConfig>` annotation no longer compiles; naming it here also
+ * keeps the declaration build portable (TS2742 otherwise).
+ */
+export type WebAuthConfigSchema = z<WebAuthConfigInput, ResolvedWebAuthConfig>
+
+/** Resolved schema for the loader and the settings plane. */
+export const Config: WebAuthConfigSchema = z.object({
+  unlockRemoteSettings: z.boolean().default(false).volatile()
 })
+
+/**
+ * Read a config field that may be a plain value or a live (`.volatile()`) node.
+ *
+ * The loader resolves a volatile field to a cosmokit cell (`{ get() }`), which
+ * is an object and therefore always truthy — reading it directly would turn the
+ * opt-in flag on everywhere. Hand-written configs (patch fixtures, tests) pass
+ * plain values, so both shapes are accepted here.
+ */
+function liveValue<T>(node: unknown, fallback: T): T {
+  if (node === undefined || node === null) return fallback
+  const getter = (node as { get?: unknown }).get
+  if (typeof getter === 'function') {
+    const value = (getter as () => unknown).call(node)
+    return value === undefined ? fallback : (value as T)
+  }
+  return node as T
+}
 
 /**
  * Mount the auth gate and its routes.
  * @param ctx - plugin context carrying the webServer service (listening).
  * @param config - validated composition config (Config schema defaults when
- *   the patch row spells none).
+ *   the patch row spells none); `unlockRemoteSettings` may arrive as a live
+ *   volatile handle and is unwrapped below.
  */
-export function apply(ctx: PluginContext, config: WebAuthConfig): void {
+export function apply(ctx: PluginContext, config: WebAuthConfig | ResolvedWebAuthConfig): void {
+  const unlockRemoteSettings = liveValue<boolean>(
+    (config as { unlockRemoteSettings?: unknown }).unlockRemoteSettings,
+    false
+  )
   const dshHome = resolveDshHome()
   const state = {
     secret: readSecret(dshHome),
@@ -152,7 +213,7 @@ export function apply(ctx: PluginContext, config: WebAuthConfig): void {
   // ── remote settings unlock (opt-in): inject ownsHost into the boot page ───
   // A config-only patch change restarts this fiber (cordis update →
   // dispose + re-apply), so the tap flips live with the composition.
-  if (config.unlockRemoteSettings) {
+  if (unlockRemoteSettings) {
     ctx.effect(() => ctx.webServer.tapIndex(injectOwnsHost), 'web-auth: remote settings unlock tap')
   }
 

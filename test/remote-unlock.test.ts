@@ -83,13 +83,28 @@ describe('Config schema', () => {
     return result
   }
 
+  /**
+   * The resolved field is a live `.volatile()` cell on dsh >= 0.1.7 — the
+   * marker that makes the settings page render at all — so assertions read
+   * through it, exactly like `apply()` does. Reading the cell directly would
+   * report the object, not the flag.
+   */
+  const resolved = (input: unknown): { unlockRemoteSettings: unknown } => {
+    const raw = (validate(input).value ?? {}) as { unlockRemoteSettings?: unknown }
+    const node = raw.unlockRemoteSettings
+    const getter = (node as { get?: unknown } | undefined)?.get
+    return {
+      unlockRemoteSettings: typeof getter === 'function' ? (getter as () => unknown).call(node) : node
+    }
+  }
+
   it('defaults to off when the patch row spells no config', () => {
-    assert.deepEqual(validate(undefined).value, { unlockRemoteSettings: false })
-    assert.deepEqual(validate({}).value, { unlockRemoteSettings: false })
+    assert.deepEqual(resolved(undefined), { unlockRemoteSettings: false })
+    assert.deepEqual(resolved({}), { unlockRemoteSettings: false })
   })
 
   it('accepts the explicit unlock and rejects invalid shapes', () => {
-    assert.deepEqual(validate({ unlockRemoteSettings: true }).value, { unlockRemoteSettings: true })
+    assert.deepEqual(resolved({ unlockRemoteSettings: true }), { unlockRemoteSettings: true })
     assert.ok(validate({ unlockRemoteSettings: 'yes' }).issues)
   })
 })

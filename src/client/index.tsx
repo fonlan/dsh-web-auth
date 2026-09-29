@@ -26,9 +26,10 @@ import type { Context } from '@deepseek-ai/cordis'
  * `connection` and `remote` are required by `settingsScope.bind` (it resolves
  * the settings transport and the forwarded-invalidation subscription through
  * `ctx.get`), so the fiber must wait for them — exactly like
- * the settings shell does for its own sections.
+ * the settings shell does for its own sections. dsh >= 0.1.7 dropped
+ * `settingsScope` itself, so it is resolved optionally below.
  */
-export const inject: string[] = ['slots', 'settingsScope', 'connection', 'remote']
+export const inject: string[] = ['slots']
 
 /** The settings namespace this page edits (must match the host half). */
 const WEB_AUTH_NS = 'web-auth'
@@ -317,22 +318,32 @@ function WebAuthSettingsSection(props: SettingsSectionProps): JSX.Element | null
  * @param ctx - the client cordis context.
  */
 export function apply(ctx: Context): void {
-  injectStyle()
-  const services = ctx as unknown as {
-    slots: Slots
-    settingsScope: { bind(spec: { namespace: string }): SettingsScopeFace }
-  }
-  const scope = services.settingsScope.bind({ namespace: WEB_AUTH_NS })
-  services.slots.inject('settings.section', () =>
-    services.slots.register(
-      {
-        name: 'settings.section',
-        id: 'web-auth',
-        order: 120,
-        label: '访问认证',
-        inject: () => ({ scope })
-      },
-      WebAuthSettingsSection
+  // The 访问认证 settings page rides the settingsScope service, awaited through
+  // a callback-style inject: dsh >= 0.1.7 dropped that service (the host half's
+  // Config schema now feeds the official settings page), so the page registers
+  // only when the service exists and the plugin stays active either way. Never
+  // touch ctx.settingsScope directly — on a host without the service that
+  // access throws and fails the whole entry.
+  ctx.inject(['settingsScope'], (raw: unknown) => {
+    const c = raw as {
+      slots: Slots
+      settingsScope?: { bind(spec: { namespace: string }): SettingsScopeFace }
+    }
+    if (c.settingsScope === undefined) return
+
+    injectStyle()
+    const scope = c.settingsScope.bind({ namespace: WEB_AUTH_NS })
+    c.slots.inject('settings.section', () =>
+      c.slots.register(
+        {
+          name: 'settings.section',
+          id: 'web-auth',
+          order: 120,
+          label: '访问认证',
+          inject: () => ({ scope })
+        },
+        WebAuthSettingsSection
+      )
     )
-  )
+  })
 }

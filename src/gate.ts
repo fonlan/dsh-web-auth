@@ -26,8 +26,13 @@ export interface GateHandlers {
    * rejection must not prevent the downstream dispatch.
    */
   passed?(req: IncomingMessage, res: ServerResponse): void | Promise<void>
-  /** Decide whether one WebSocket upgrade may proceed. */
-  allowUpgrade(req: IncomingMessage): boolean
+  /**
+   * Decide whether one WebSocket upgrade may proceed. May be async: the gate
+   * awaits the decision before forwarding, letting a handler repair the
+   * request (for example by resolving a session cookie onto its headers)
+   * instead of only approving or refusing it.
+   */
+  allowUpgrade(req: IncomingMessage): boolean | Promise<boolean>
 }
 
 const gated = new WeakSet<Server>()
@@ -72,13 +77,21 @@ export function installGate(server: Server, handlers: GateHandlers): () => void 
   })
 
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-    if (!handlers.allowUpgrade(req)) {
-      rejectUpgrade(socket)
-      return
-    }
-    for (const listener of upgradeListeners) {
-      ;(listener as (req: IncomingMessage, socket: Duplex, head: Buffer) => void)(req, socket, head)
-    }
+    void (async () => {
+      let allowed: boolean
+      try {
+        allowed = await handlers.allowUpgrade(req)
+      } catch {
+        allowed = false
+      }
+      if (!allowed) {
+        if (!socket.destroyed && socket.writable) rejectUpgrade(socket)
+        return
+      }
+      for (const listener of upgradeListeners) {
+        ;(listener as (req: IncomingMessage, socket: Duplex, head: Buffer) => void)(req, socket, head)
+      }
+    })()
   })
 
   return () => {

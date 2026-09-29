@@ -4,6 +4,7 @@
  * /logout, and the JSON change-password API for the settings page.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createHash } from 'node:crypto'
 import {
   COOKIE_NAME,
   MIN_PASSWORD_LENGTH,
@@ -206,12 +207,42 @@ function clearCookie(res: ServerResponse, secure: boolean): void {
 
 export interface Gate {
   allow(req: IncomingMessage, res: ServerResponse): boolean
-  allowUpgrade(req: IncomingMessage): boolean
+  allowUpgrade(req: IncomingMessage): boolean | Promise<boolean>
   passed?(req: IncomingMessage, res: ServerResponse): void | Promise<void>
 }
 
 /** Minimum interval between server-side DSH cookie mints (debounce). */
 const DSH_MINT_DEBOUNCE_MS = 1000
+
+/** Per-peer cooldown between late-mint redirects (loop breaker). */
+const LATE_MINT_COOLDOWN_MS = 5000
+
+/**
+ * Name of DSH's authority-bound browser-session cookie for one authority.
+ * Mirrors the host's own `dsh-auth-<base64url(sha256(authority))>` scheme; if
+ * the scheme ever drifts this only misreads "carried" as "missing", which
+ * costs one harmless extra redirect, never a denial.
+ *
+ * Exported for the integration suite, which models a browser jar: the gate's
+ * "already carries the cookie" check is name-based, so a test that stores a
+ * differently-named cookie would silently exercise the late-mint path instead
+ * of the steady state.
+ */
+export function dshAuthCookieName(authority: string): string {
+  return 'dsh-auth-' + createHash('sha256').update(authority).digest('base64url')
+}
+
+/**
+ * Whether the request already carries a DSH browser-session cookie for the
+ * loopback authority every authenticated request is rewritten to. Unknown
+ * authority (webserver not bound yet) counts as carried: no intervention.
+ */
+function carriesLoopbackDshCookie(req: IncomingMessage, authority: string | undefined): boolean {
+  if (authority === undefined) return true
+  const raw = req.headers.cookie
+  if (raw === undefined) return false
+  return cookieValue(raw, dshAuthCookieName(authority)) !== undefined
+}
 
 /** Number of `token` query parameters in the request URL. */
 export function tokenQueryCount(req: IncomingMessage): number {
@@ -285,6 +316,54 @@ export function createGate(env: HandlerEnv): Gate {
     }
   }
 
+  /** Last late-mint redirect per peer address (loop breaker). */
+  const lateMintAt = new Map<string, number>()
+
+  /**
+   * One late-mint redirect per peer per cooldown window. A client that keeps
+   * refusing the relayed cookie must not be bounced forever; after the first
+   * bounce it passes through and DSH's own response (401 + the relayed
+   * cookie) is the fallback, exactly the pre-existing behavior.
+   */
+  const lateMintDue = (req: IncomingMessage): boolean => {
+    const peer = req.socket.remoteAddress ?? ''
+    const t = now()
+    const last = lateMintAt.get(peer)
+    if (last !== undefined && t - last < LATE_MINT_COOLDOWN_MS) return false
+    lateMintAt.set(peer, t)
+    return true
+  }
+
+  /**
+   * Answer a session-authenticated request that carries no DSH browser-
+   * session cookie for the loopback authority: mint the cookie server-side
+   * and bounce once through the same URL so the browser stores it. Without
+   * this, a browser holding only the plugin session reaches DSH and gets its
+   * raw 401 dead end ("reopen the URL printed by dsh web"), recovering only
+   * if the user happens to visit again; the redirect makes the first visit
+   * succeed. Falls back to /login when the mint is unavailable — that page
+   * retries the mint and offers the password form.
+   */
+  const respondWithLateMint = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const mint = env.mintDshCookie
+    const cookie = mint === undefined ? undefined : await mint().catch(() => undefined)
+    // Share the mint throttle with the opportunistic mint in `passed()`: the
+    // retry that follows this bounce would otherwise spend a second loopback
+    // exchange to mint the very cookie it just stored.
+    if (cookie !== undefined) lastMintAt = now()
+    if (res.headersSent) return
+    if (cookie === undefined) {
+      redirect(res, '/login?next=' + encodeURIComponent(sanitizeNext(req.url) ?? '/'))
+      return
+    }
+    res.writeHead(302, {
+      'cache-control': 'no-store',
+      location: req.url ?? '/',
+      'set-cookie': cookie
+    })
+    res.end()
+  }
+
   /**
    * Present AUTHENTICATED traffic as loopback to every downstream
    * browser-trust fence, without tracking plugin path prefixes. The /api
@@ -334,8 +413,20 @@ export function createGate(env: HandlerEnv): Gate {
       // response, so the post-login / request is already authenticated and
       // the browser never needs the token itself.
       if (method === 'GET' && pathname === '/' && tokenQueryCount(req) > 0) {
-        if (sessionOf(req) !== undefined || isMintReentry(req)) {
+        if (isMintReentry(req)) {
           rewriteAsLoopback(req)
+          return true
+        }
+        const tokenedSession = sessionOf(req)
+        if (tokenedSession !== undefined) {
+          if (needsSessionRefresh(tokenedSession, now())) {
+            setSessionCookie(res, env.state.secret, now(), isSecureRequest(req))
+          }
+          rewriteAsLoopback(req)
+          if (!carriesLoopbackDshCookie(req, env.loopbackAuthority) && lateMintDue(req)) {
+            void respondWithLateMint(req, res)
+            return false
+          }
           return true
         }
         redirect(res, '/login?next=' + encodeURIComponent(sanitizeNext(pathname) ?? '/'))
@@ -347,6 +438,14 @@ export function createGate(env: HandlerEnv): Gate {
           setSessionCookie(res, env.state.secret, now(), isSecureRequest(req))
         }
         rewriteAsLoopback(req)
+        if (
+          (method === 'GET' || method === 'HEAD') &&
+          !carriesLoopbackDshCookie(req, env.loopbackAuthority) &&
+          lateMintDue(req)
+        ) {
+          void respondWithLateMint(req, res)
+          return false
+        }
         return true
       }
       if (method === 'GET' || method === 'HEAD') {
@@ -357,9 +456,29 @@ export function createGate(env: HandlerEnv): Gate {
       }
       return false
     },
-    allowUpgrade(req) {
+    async allowUpgrade(req) {
       if (sessionOf(req) === undefined) return false
       rewriteAsLoopback(req)
+      // A WebSocket upgrade carries cookies only through its request headers,
+      // and there is no redirect to repair a missing one — so resolve the DSH
+      // browser cookie onto this very request before the host's own gate reads
+      // it. Without this, a browser that reached the app through a cached page
+      // (no HTTP round-trip, so no late-mint) has every /api/remote.mux upgrade
+      // refused: all remote calls fail, surfacing as errors like the welcome
+      // acknowledgement failing to save.
+      if (!carriesLoopbackDshCookie(req, env.loopbackAuthority)) {
+        const mint = env.mintDshCookie
+        const cookie = mint === undefined ? undefined : await mint().catch(() => undefined)
+        if (cookie !== undefined) {
+          // Same shared throttle as the other mint sites (see respondWithLateMint).
+          lastMintAt = now()
+          const pair = cookie.split(';')[0]?.trim()
+          if (pair !== undefined && pair.length > 0) {
+            req.headers.cookie =
+              req.headers.cookie === undefined ? pair : req.headers.cookie + '; ' + pair
+          }
+        }
+      }
       return true
     },
     async passed(req, res) {
