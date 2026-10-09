@@ -6,11 +6,11 @@
 
 - **登录页 + HttpOnly 签名 Cookie**（HMAC-SHA256，7 天滑动续期），浏览器自动携带，HTTP / WebSocket / SSE / 静态资源全覆盖
 - **首次设置**：未配置密码时，登录页显示「设置访问密码」表单（引导流程，见下文安全说明）
-- **GUI 改密**：设置 → 插件 →「访问认证」卡片（插件配置 tab），需旧密码；改密后**轮换签名密钥，所有已登录会话立即下线**
+- **GUI 改密**：设置 → 侧栏「访问认证」页面，需旧密码；改密后**轮换签名密钥，所有已登录会话立即下线**
 - **退出登录**：设置卡片按钮，或访问 `/logout`
 - **防爆破**：登录与改密接口按客户端 IP 限速（连续 5 次失败锁 1 分钟起，指数退避至 30 分钟；15 分钟内累计）
-- **反代友好**：Cookie `Secure` 自动跟随 `x-forwarded-proto`；限速信任回环对端的 `X-Forwarded-For`
-- **监听地址切换**：设置卡片可一键把 dsh 的监听地址在 `127.0.0.1`（仅本机）与 `0.0.0.0`（所有网卡 / 局域网可访问）之间切换，热生效、无需重启进程（写入 `web-auth` settings 命名空间 → host 半区应用 patch → HMR 重绑 webserver）
+- **反代友好**：Cookie `Secure` 自动跟随 `x-forwarded-proto`；限速信任本机对端的 `X-Forwarded-For`
+- **监听地址切换**：设置卡片可在**本机网卡的具体地址**之间切换（含 `127.0.0.1` 仅本机、以及每张网卡的 IP），热生效、无需重启进程（REST → host 半区应用 patch → HMR 重绑 webserver）。**不再提供 `0.0.0.0`**：dsh `0.2.1-alpha.2` 起通配符地址会在解析配置阶段直接让启动失败，写进去即硬砖（见下文「通配符与启动失败」）
 - **远程设置解锁（可选）**：`unlockRemoteSettings` 组合配置在启动页注入 `__DSH_TRANSPORT__.ownsHost` 标志，让反代域名下的设置面（模型页、插件配置、常规设置等）完整可用，默认关闭（见下文安全权衡）
 - **启动令牌收口**：未登录浏览器带旧 `?token=` 链接访问一律重定向回登录页，只有插件自身的服务端 mint 走回环放行通道——既不需要手工引导，也不会再撞上 DSH 的 `401` 死页面（`0.1.7` 起）
 - 密码以 **scrypt 加盐哈希**存储（`$DSH_HOME/web-auth/password.hash`，0600），永不回显、不落明文配置
@@ -29,6 +29,8 @@ dsh plugin --profile web update @fonlan/dsh-web-auth
 
 > 安装后**需要重启 dsh web 进程**才生效（当前会话会短暂断连重连）。
 
+**宿主兼容性**：`0.2.0` 面向 dsh `^0.2.0-rc.1 || ^0.2.1-alpha.1 || ^0.2.1-alpha.2`，含两处按宿主演进做的适配：取值域去掉通配符（宿主 `0.2.1-alpha.2` 起拒绝），设置页不再依赖已被移除的客户端 `settingsScope` 服务（改走本插件 REST）。在更早的 `0.1.x` 宿主上本插件同样可用，但请勿把监听地址设成 `0.0.0.0`——宿主一旦升级到 `0.2.1-alpha.2`，该值会让 dsh 无法启动（见下文「通配符与启动失败」）。
+
 ## 激活（首次设置密码）
 
 重启后打开 dsh web，会被重定向到登录页：
@@ -36,7 +38,7 @@ dsh plugin --profile web update @fonlan/dsh-web-auth
 1. 未设置过密码时，登录页显示「设置访问密码」——输入 **≥8 位**的新密码并确认
 2. 设置成功后立即签发会话并跳回原页面；此后每次访问都要输密码
 
-改密入口在 **设置 → 插件 → 插件配置 → 访问认证**（需先登录）。
+改密入口在 **设置 → 侧栏「访问认证」**（需先登录）。
 
 ## 行为细节
 
@@ -55,21 +57,57 @@ dsh plugin --profile web update @fonlan/dsh-web-auth
 | 连续失败 | 按 IP 限速，提示「尝试过于频繁」 |
 | 会话过期 | 跳回登录页；滑动续期：剩余不足 24h 自动刷新 |
 | 修改密码 | 校验旧密码 → 轮换签名密钥 → **全员下线**，跳转登录页 |
-| 切换监听地址（设置卡片） | 校验取值（仅 `127.0.0.1` / `0.0.0.0`）→ 写入 `web-auth` settings 命名空间（revision 设栅）→ host 半区应用 patch（profile 优先，home 兜底）→ HMR 热重载 webserver 重新绑定；**WebSocket 短暂断连后自动重连** |
+| 切换监听地址（设置卡片） | 校验取值（必须是具体 IPv4/IPv6 字面量，**通配符被拒绝**）→ `POST /api/web-auth/listen` → host 半区应用 patch（profile 优先，home 兜底）→ HMR 热重载 webserver 重新绑定；**WebSocket 短暂断连后自动重连** |
 | `/logout` | 清除 Cookie，跳转登录页 |
 
 > **无需再处理 DSH 自己的启动令牌**：DSH 的浏览器会话认证（`dsh web` 启动时打印的 `http://127.0.0.1:3080/?token=…`）用 cookie 绑定 Host。插件会把所有已认证请求的 Host 改写为回环地址，而 DSH 的 cookie 必须与「DSH 看到的 Host」一致——`0.1.5` 起插件会在登录/会话期间**自动在服务端完成 DSH 令牌交换**并把 `dsh-auth` cookie 转交给浏览器（含持续续期），所以外部设备、新浏览器都不需要再手工访问带 token 的 URL。`0.1.7` 起这条路径进一步收紧：未登录浏览器带 `token` 访问会被重定向到 `/login` 并丢弃该参数（旧令牌在 dsh 重启后即失效，放行只会展示 DSH 自己的 `401` 页面），登录本身就已经完成 mint，不再需要任何手工引导步骤。
 
 ### 切换监听地址
 
-dsh 默认只监听 `127.0.0.1`。在 **设置 → 插件 → 插件配置 → 访问认证** 卡片底部可以把它切换为 `0.0.0.0`（所有网卡，局域网可访问），或切回仅本机——无需重启 dsh 进程：
+dsh 默认只监听 `127.0.0.1`。在 **设置 → 侧栏「访问认证」** 页面底部可以把它切换为本机任意网卡上的**具体地址**（列表由 host 半区枚举 `os.networkInterfaces()` 生成），或切回 `127.0.0.1` 仅本机——无需重启 dsh 进程：
 
-- 切换写入 `web-auth` settings 命名空间（`$DSH_HOME/settings.yaml`，revision 设栅）；host 半区监听到提交后应用到当前部署的 patch 层：profile 的 `cordis.patch.yml`；若 home 层（`$DSH_HOME/cordis.patch.yml`）已声明 webserver 行则写 home 层（home 优先级更高，改在低层会被覆盖）。文件里其余内容（注释、`!!js` 端口表达式）原样保留。
-- dsh 的 HMR 会监听到 patch 文件变化并热重载 webserver 行：**关闭旧监听、按新地址重新绑定**，全程无需重启进程。重启进程后该设置依然生效（settings 命名空间 + patch 文件都在）。
+- 页面先 `GET /api/web-auth/status` 取当前地址与候选列表（`allowed`），提交时 `POST /api/web-auth/listen`；host 半区把取值写进当前部署的 patch 层：profile 的 `cordis.patch.yml`；若 home 层（`$DSH_HOME/cordis.patch.yml`）已声明 webserver 行则写 home 层（home 优先级更高，改在低层会被覆盖）。文件里其余内容（注释、`!!js` 端口表达式）原样保留。
+- 写入前统一过 `isLocalListenHost`：必须是 IPv4/IPv6 **字面量**、不是通配符、并且**确实是本机网卡拥有的地址**，否则直接拒绝（`400 invalid-host`，响应里附上合法候选列表），不会写坏文件。下拉列表即由同一枚举生成，页面不可能提供一个写不进去的值。
+- dsh 的 HMR 会监听到 patch 文件变化并热重载 webserver 行：**关闭旧监听、按新地址重新绑定**，全程无需重启进程。重启进程后该设置依然生效（patch 文件在）。
 - 切换瞬间所有连接（包括当前页面与 WebSocket）会断开重连，属正常现象；卡片会轮询状态确认新地址生效。
-- 注意：若你正通过**局域网 IP**（`0.0.0.0` 模式）访问并切回 `127.0.0.1`，切回后只能在本机访问，请改用 `127.0.0.1` 重新打开页面。
+- **绑定具体网卡地址后 `127.0.0.1` 不再监听**：本机也必须改用该地址访问（`http://<网卡地址>:3080`）。想同时保留本机与局域网入口，请让 dsh 继续监听 `127.0.0.1`，另在本机放一层反代监听局域网/公网并指向它——这也是 dsh 现在推荐的暴露方式。
+- 注意：若你正通过**局域网 IP** 访问并切回 `127.0.0.1`，切回后只能在本机访问，请改用 `127.0.0.1` 重新打开页面。
 
 > 该能力依赖 webserver 行位于 profile/home patch 层（默认安装即如此）。若你的 webserver 配置来自自定义 `--patch` overlay，请直接编辑 overlay 文件。
+
+### 写入值导致启动失败（三类，及恢复方式）
+
+监听地址是**组合配置**，写在 patch 文件里、由 loader 在启动时读取。因此一个写坏的取值不是「绑定失败」而已——它会让**下一次启动整体失败**，而本插件自己也在 waiting、无法自救。`0.2.0` 把所有已知的三类都堵在写入之前：
+
+| 类别 | 写坏后会看到 | 插件现在如何拦截 |
+|---|---|---|
+| 通配符 `0.0.0.0` / `::` | 解析配置阶段报 `host "0.0.0.0" is an unspecified (wildcard) address, which is not supported …` | 通配符一律拒绝（`400 invalid-host` / 写盘前抛错） |
+| 本机没有的地址（如 macOS 上的 `127.0.0.2`、过期 DHCP 地址） | `listen EADDRNOTAVAIL: address not available …` | 只接受**本机网卡实际拥有**的地址（`os.networkInterfaces()` 枚举，`127.0.0.1` 恒定可用） |
+| 把行追加到模板的空序列 `[]` 之后 | `failed to parse overlay …: end of the stream or a document separator is expected` | 识别模板 `[]` 并**替换**它（非空 flow 文档直接拒绝编辑） |
+
+三类症状长这样（`webserver` 未激活，所有依赖它的插件排队等 `webServer`）：
+
+```
+dsh: startup failed: 2 required plugins did not activate
+  webserver (required)  @deepseek-ai/dsh-host-webserver  → 上面某一类报错
+Plugins waiting for services:
+  web-runtime / web-auth / better-sidebar / task-kanban / … (missing webServer)
+```
+
+恢复方式都是手工改 patch 文件（插件此时不会加载）：
+
+```bash
+# 1) 看当前写死的 host
+grep -n -A3 '^- id: webserver' ~/.dsh/profiles/web/cordis.patch.yml
+# 2) 改成 127.0.0.1（或本机某张网卡的实际地址）后保存
+```
+
+若第一行是 `[]` 之类的空序列而下面又跟了 `- id:` 行，把那个 `[]` 行整行删掉即为合法文档。
+
+> **DHCP 提醒**：绑定具体网卡地址后，地址由 DHCP 变化（或网卡消失）时，下一次启动同样会 `EADDRNOTAVAIL`。长期部署建议让 dsh 监听 `127.0.0.1`，把对外暴露交给本机反代（反代再指向回环），这样地址变化不影响 dsh 启动。
+
+`0.2.0` 起插件的所有写路径都会在改动任何字节之前校验，因此这三类砖不会再被本插件写出来。（若你仍在用 `0.1.10` 及更早版本并已中招，同样按上面方式手工修复，再升级到 `0.2.0`。）
+
 
 ### 远程设置解锁（`unlockRemoteSettings`，默认关闭）
 
@@ -109,11 +147,11 @@ npm run test       # 单元 + 集成测试（node:test，真实 HTTP/WS 全流�
 - `src/auth-core.ts` — 纯逻辑：scrypt 哈希、Cookie 签名/校验、限速器、`next` 校验
 - `src/gate.ts` — 把认证闸门包到 node:http 服务器的 request/upgrade 监听器外层
 - `src/handlers.ts` — 登录页/登录/登出/改密/状态/监听切换 路由处理
-- `src/profile-patch.ts` — 监听地址切换：webserver 行的 patch 层文本改写（保留注释与 `!!js` 表达式）
+- `src/profile-patch.ts` — 监听地址切换：webserver 行的 patch 层文本改写（保留注释与 `!!js` 表达式），并在写入前拒绝通配符
+- `src/listen-addresses.ts` — 监听地址取值域：字面量/通配符判定、本机网卡枚举（候选列表）、本机对端判定（mint 重入与 XFF 信任）
 - `src/remote-unlock.ts` — 远程设置解锁：`unlockRemoteSettings` 开启时经 `webServer.tapIndex` 注入 `ownsHost` 启动页脚本
-- `src/settings.ts` — `web-auth` settings 命名空间注册 + listenHost 变更应用（卡片的分发键与数据源）
 - `src/index.ts` — cordis 插件装配（host 半区）
-- `src/client/index.tsx` — 设置卡片（浏览器半区，`settings.plugin.item` 插槽，keyed by `web-auth` 命名空间）
+- `src/client/index.tsx` — 设置卡片（浏览器半区，`settings.section` 插槽，id `web-auth`；读写走本插件 REST）
 - `cordis.patch.yml` — bundle 补丁层（insert 插件行）
 
 ## License

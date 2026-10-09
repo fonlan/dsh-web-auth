@@ -24,8 +24,17 @@ import {
   type ListenController
 } from '../lib/handlers.js'
 import { RateLimiter, SESSION_TTL_SECONDS, hashPassword } from '../lib/auth-core.js'
+import { listListenHosts } from '../lib/listen-addresses.js'
 
 const PASSWORD = 'correct-horse-battery'
+
+/**
+ * A real non-loopback address of THIS machine, or undefined when it has none
+ * (a bare container). The handlers validate the requested host against the
+ * machine's own addresses, so a hardcoded LAN IP would pass locally and fail
+ * on CI; tests that need one skip without it.
+ */
+const ALT_HOST = listListenHosts().find((option) => !option.loopback)?.value
 
 interface Harness {
   base: string
@@ -912,11 +921,41 @@ describe('status API and authenticated upgrades', () => {
     const cookie = await h.login(PASSWORD)
     const r = await h.request('/api/web-auth/status', { headers: h.authHeaders(cookie) })
     assert.equal(r.status, 200)
-    assert.deepEqual(await r.json(), { configured: true })
+    const body = (await r.json()) as {
+      configured: boolean
+      allowed: { value: string; label: string; loopback: boolean }[]
+      needsMigration: boolean
+    }
+    assert.equal(body.configured, true)
+    // no listen controller (CLI/headless): no host, but the selectable
+    // addresses are still reported from the machine's interfaces
+    assert.equal(body.needsMigration, false)
+    assert.equal(body.allowed[0]?.value, '127.0.0.1')
+    assert.equal(body.allowed[0]?.loopback, true)
+    // the wildcard is never among the options
+    assert.equal(body.allowed.some((o) => o.value === '0.0.0.0' || o.value === '::'), false)
     await h.close()
   })
 
-  it('reports the current bind host when a listen controller is bound', async () => {
+  it('reports the current bind host and flags a legacy wildcard for migration', async () => {
+    const h = createHarness(true, undefined, {
+      current: () => '127.0.0.1',
+      prepare: () => '',
+      commit: () => {}
+    })
+    const cookie = await h.login(PASSWORD)
+    const r = await h.request('/api/web-auth/status', { headers: h.authHeaders(cookie) })
+    assert.equal(r.status, 200)
+    const body = (await r.json()) as { configured: boolean; host?: string; needsMigration: boolean }
+    assert.equal(body.configured, true)
+    assert.equal(body.host, '127.0.0.1')
+    assert.equal(body.needsMigration, false)
+    await h.close()
+  })
+
+  it('flags a legacy wildcard bind (older host) as needing migration', async () => {
+    // Only reachable on a host older than 0.2.1-alpha.2, which still boots on
+    // the wildcard; the page must steer the user to a concrete address.
     const h = createHarness(true, undefined, {
       current: () => '0.0.0.0',
       prepare: () => '',
@@ -924,8 +963,12 @@ describe('status API and authenticated upgrades', () => {
     })
     const cookie = await h.login(PASSWORD)
     const r = await h.request('/api/web-auth/status', { headers: h.authHeaders(cookie) })
-    assert.equal(r.status, 200)
-    assert.deepEqual(await r.json(), { configured: true, host: '0.0.0.0' })
+    const body = (await r.json()) as { host?: string; needsMigration: boolean; allowed: { value: string }[] }
+    assert.equal(body.host, '0.0.0.0')
+    assert.equal(body.needsMigration, true)
+    // ...and the wildcard is NOT among the writable options (it must never be
+    // re-appliable), so the page steers the user to a concrete address
+    assert.equal(body.allowed.some((o) => o.value === '0.0.0.0' || o.value === '::'), false)
     await h.close()
   })
 
@@ -956,7 +999,7 @@ describe('listen change API', () => {
     await h.close()
   })
 
-  it('rejects hosts outside the two allowed literals', async () => {
+  it('rejects the wildcard and non-literals before touching the patch', async () => {
     let prepared = 0
     const h = createHarness(true, undefined, {
       current: () => '127.0.0.1',
@@ -967,18 +1010,44 @@ describe('listen change API', () => {
       commit: () => {}
     })
     const cookie = await h.login(PASSWORD)
-    for (const host of ['localhost', '10.0.0.5', 42, null, undefined]) {
+    // 0.0.0.0 / :: are the values dsh >= 0.2.1-alpha.2 fails the whole startup
+    // on: a stale client must never be able to write one.
+    for (const host of ['0.0.0.0', '::', '::ffff:0.0.0.0', 'localhost', '', 42, null, undefined]) {
       const r = await h.request('/api/web-auth/listen', {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
         body: JSON.stringify({ host })
       })
-      assert.equal(r.status, 400)
-      const body = (await r.json()) as { error: string; allowed?: string[] }
+      assert.equal(r.status, 400, `expected ${String(host)} to be refused`)
+      const body = (await r.json()) as { error: string; allowed?: { value: string }[] }
       assert.equal(body.error, 'invalid-host')
-      assert.deepEqual(body.allowed, ['127.0.0.1', '0.0.0.0'])
+      assert.equal(body.allowed?.[0]?.value, '127.0.0.1')
     }
     assert.equal(prepared, 0)
+    await h.close()
+  })
+
+  it('accepts a local address of this machine', async (t) => {
+    if (ALT_HOST === undefined) return t.skip('no non-loopback interface on this host')
+    let prepared = 0
+    const h = createHarness(true, undefined, {
+      current: () => '127.0.0.1',
+      prepare: (host) => {
+        prepared += 1
+        assert.equal(host, ALT_HOST)
+        return '# next patch\n'
+      },
+      commit: () => {}
+    })
+    const cookie = await h.login(PASSWORD)
+    const r = await h.request('/api/web-auth/listen', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
+      body: JSON.stringify({ host: ALT_HOST })
+    })
+    assert.equal(r.status, 200)
+    assert.deepEqual(await r.json(), { ok: true, host: ALT_HOST, applying: true })
+    assert.equal(prepared, 1)
     await h.close()
   })
 
@@ -988,14 +1057,15 @@ describe('listen change API', () => {
     const r = await h.request('/api/web-auth/listen', {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
-      body: JSON.stringify({ host: '0.0.0.0' })
+      body: JSON.stringify({ host: '127.0.0.1' })
     })
     assert.equal(r.status, 501)
     assert.deepEqual(await r.json(), { error: 'unsupported' })
     await h.close()
   })
 
-  it('prepares then commits the patch for a real switch', async () => {
+  it('prepares then commits the patch for a real switch', async (t) => {
+    if (ALT_HOST === undefined) return t.skip('no non-loopback interface on this host')
     let current = '127.0.0.1'
     const calls: { phase: string; host: string }[] = []
     const h = createHarness(true, undefined, {
@@ -1006,31 +1076,34 @@ describe('listen change API', () => {
       },
       commit: (content) => {
         calls.push({ phase: 'commit', host: content })
-        current = '0.0.0.0'
+        current = ALT_HOST
       }
     })
     const cookie = await h.login(PASSWORD)
     const r = await h.request('/api/web-auth/listen', {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
-      body: JSON.stringify({ host: '0.0.0.0' })
+      body: JSON.stringify({ host: ALT_HOST })
     })
     assert.equal(r.status, 200)
-    assert.deepEqual(await r.json(), { ok: true, host: '0.0.0.0', applying: true })
+    assert.deepEqual(await r.json(), { ok: true, host: ALT_HOST, applying: true })
     assert.deepEqual(calls, [
-      { phase: 'prepare', host: '0.0.0.0' },
+      { phase: 'prepare', host: ALT_HOST },
       { phase: 'commit', host: '# next patch\n' }
     ])
     // the controller's own state moved, and status reflects it
     const status = await h.request('/api/web-auth/status', { headers: h.authHeaders(cookie) })
-    assert.deepEqual(await status.json(), { configured: true, host: '0.0.0.0' })
+    const body = (await status.json()) as { configured: boolean; host?: string }
+    assert.equal(body.configured, true)
+    assert.equal(body.host, ALT_HOST)
     await h.close()
   })
 
   it('short-circuits when the requested host is already active', async () => {
+    // 127.0.0.1 is always a valid, writable value, so this needs no interface
     let calls = 0
     const h = createHarness(true, undefined, {
-      current: () => '0.0.0.0',
+      current: () => '127.0.0.1',
       prepare: () => {
         calls += 1
         return ''
@@ -1043,18 +1116,45 @@ describe('listen change API', () => {
     const r = await h.request('/api/web-auth/listen', {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
-      body: JSON.stringify({ host: '0.0.0.0' })
+      body: JSON.stringify({ host: '127.0.0.1' })
     })
     assert.equal(r.status, 200)
-    assert.deepEqual(await r.json(), { ok: true, host: '0.0.0.0', unchanged: true })
+    assert.deepEqual(await r.json(), { ok: true, host: '127.0.0.1', unchanged: true })
     assert.equal(calls, 0)
+    await h.close()
+  })
+
+  it('refuses a concrete literal this machine does not own', async () => {
+    // The next boot would fail with EADDRNOTAVAIL, so the write is refused.
+    let prepared = 0
+    const h = createHarness(true, undefined, {
+      current: () => '127.0.0.1',
+      prepare: () => {
+        prepared += 1
+        return ''
+      },
+      commit: () => {}
+    })
+    const cookie = await h.login(PASSWORD)
+    for (const host of ['127.0.0.2', '10.99.99.99', '203.0.113.7', '2001:db8::1']) {
+      const r = await h.request('/api/web-auth/listen', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
+        body: JSON.stringify({ host })
+      })
+      assert.equal(r.status, 400, `expected ${host} to be refused`)
+      assert.equal(((await r.json()) as { error: string }).error, 'invalid-host')
+    }
+    assert.equal(prepared, 0)
     await h.close()
   })
 
   it('refuses with 500 and never commits when preparation fails', async () => {
     let commits = 0
     const h = createHarness(true, undefined, {
-      current: () => '127.0.0.1',
+      // a legacy wildcard bind (older host): different from the requested
+      // address, so the handler proceeds to prepare — which then fails
+      current: () => '0.0.0.0',
       prepare: () => {
         throw new Error('boom')
       },
@@ -1066,7 +1166,7 @@ describe('listen change API', () => {
     const r = await h.request('/api/web-auth/listen', {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...h.authHeaders(cookie) },
-      body: JSON.stringify({ host: '0.0.0.0' })
+      body: JSON.stringify({ host: '127.0.0.1' })
     })
     assert.equal(r.status, 500)
     const body = (await r.json()) as { error: string; message: string }

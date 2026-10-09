@@ -37,8 +37,8 @@ import {
   writeWebserverHostPatch,
   type ListenHost
 } from './profile-patch.ts'
-import { installWebAuthSettings } from './settings.ts'
 import { injectOwnsHost } from './remote-unlock.ts'
+import { resetLocalAddressCache } from './listen-addresses.ts'
 import type { PluginContext } from './context-types.ts'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
@@ -180,11 +180,20 @@ export function apply(ctx: PluginContext, config: WebAuthConfig | ResolvedWebAut
     listen: buildListenController(ctx)
   }
 
-  // The plugin's own settings page (设置 → 侧栏「访问认证」) rides the
-  // `web-auth` settings namespace: binding the namespace is how the page reads
-  // and writes it, and committed listenHost changes are applied here. Attaches
-  // only when a settings service exists (CLI/headless profiles skip it).
-  installWebAuthSettings(ctx, env.listen)
+  // The listen host is changed through the plugin's own REST surface
+  // (/api/web-auth/listen) and applied to the patch layer by `env.listen`:
+  // the webserver's bind host is composition config, and the patch is the
+  // only place the loader reads it from. The value domain is a concrete
+  // local interface address — never the wildcard, which fails the whole
+  // startup on dsh >= 0.2.1-alpha.2 (see listen-addresses.ts).
+  //
+  // Earlier releases mirrored the value into a `web-auth` settings namespace
+  // (settings.register + scope.watch). That API no longer exists: dsh
+  // >= 0.2.1-alpha.2 replaced it with schema-driven SettingsForms
+  // (describe/update keyed by profile entry id), and the browser-side
+  // `settingsScope` service is gone with it. The namespace registration is
+  // therefore removed rather than left calling a method that is no longer
+  // there; the settings page talks to the REST endpoints below.
 
   if (state.readHash() === undefined) {
     // console.error, not ctx.logger.warn: the cordis default logger level
@@ -292,7 +301,12 @@ function buildDshCookieMinter(ctx: PluginContext): () => Promise<string | undefi
   })
   return async () => {
     if (connection === undefined) return undefined
-    const host = ctx.webServer.host === '0.0.0.0' || ctx.webServer.host === '::' ? '127.0.0.1' : ctx.webServer.host
+    // The bind host is a concrete literal (dsh rejects the wildcard outright),
+    // so the mint re-enters through the very address the server listens on.
+    // The legacy wildcard mapping stays as belt-and-braces: on a host old
+    // enough to accept it, loopback is the reachable spelling of "any".
+    const bound = ctx.webServer.host
+    const host = bound === '0.0.0.0' || bound === '::' ? '127.0.0.1' : bound
     try {
       const url = connection.authenticatedUrl(`http://${host}:${String(ctx.webServer.port)}`)
       // The marker header is what the gate's token branch keys on to forward
@@ -342,6 +356,10 @@ function buildListenController(ctx: PluginContext) {
       setTimeout(() => {
         try {
           writeWebserverHostPatch(patchPath, content)
+          // The listener is about to move to another interface: drop the
+          // cached local-address set so peer trust follows the new bind
+          // immediately instead of after the TTL.
+          resetLocalAddressCache()
         } catch (error) {
           console.error('[dsh-web-auth] failed to apply listen address:', error)
         }

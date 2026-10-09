@@ -9,26 +9,21 @@
  * The page shows whether the password gate is configured, changes the
  * password (old + new, via the host's POST /api/web-auth/password — which
  * rotates the signing secret and invalidates every session, including this
- * one), and switches the listen host: the bind host is written through the
- * client settings scope (revision-fenced, one source of truth), the host
- * half applies it to the patch layer, and HMR rebinds the webserver — the
- * page polls /api/web-auth/status until the new host is live.
+ * one), and switches the listen host: the address is one of the machine's
+ * concrete interface addresses (reported by GET /api/web-auth/status, never
+ * the wildcard — dsh 0.2.1-alpha.2+ fails the whole startup on it), POSTed to
+ * /api/web-auth/listen, applied to the patch layer by the host half, and then
+ * hot-applied by HMR. The page polls /api/web-auth/status until the new host
+ * is live.
  *
  * Deps resolved from the browser module table: react only. The slots and
  * settingsScope services are reached through the cordis context; types come
  * from devDependencies and are erased at build time.
  */
-import { useEffect, useState, useSyncExternalStore } from 'react'
+import { useEffect, useState } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 
-/** Services provided by other browser plugins before this one mounts.
- *
- * `connection` and `remote` are required by `settingsScope.bind` (it resolves
- * the settings transport and the forwarded-invalidation subscription through
- * `ctx.get`), so the fiber must wait for them — exactly like
- * the settings shell does for its own sections. dsh >= 0.1.7 dropped
- * `settingsScope` itself, so it is resolved optionally below.
- */
+/** Services provided by other browser plugins before this one mounts. */
 export const inject: string[] = ['slots']
 
 /** The settings namespace this page edits (must match the host half). */
@@ -46,23 +41,6 @@ interface SlotEntry {
 interface Slots {
   inject(name: string, register: () => unknown): unknown
   register(def: SlotEntry, component: unknown): unknown
-}
-
-/** Client settings scope face (subset of the app client modules). */
-interface SettingsScopeFace {
-  getSnapshot(): {
-    status: 'loading' | 'ready' | 'unavailable'
-    value?: { listenHost?: string }
-    writable: boolean
-  }
-  subscribe(listener: () => void): () => void
-  set(field: string, value: unknown): Promise<void>
-  unset(field: string): Promise<void>
-}
-
-interface SettingsSectionProps {
-  /** The bound `web-auth` settings scope (from the slot entry's inject face). */
-  scope: SettingsScopeFace
 }
 
 const CSS = `
@@ -131,45 +109,69 @@ async function changePassword(oldPassword: string, newPassword: string): Promise
   }
 }
 
-type ListenHost = '127.0.0.1' | '0.0.0.0'
+type ListenOption = { value: string; label: string; loopback: boolean }
 
-const LISTEN_OPTIONS: { value: ListenHost; label: string }[] = [
-  { value: '127.0.0.1', label: '127.0.0.1（仅本机）' },
-  { value: '0.0.0.0', label: '0.0.0.0（所有网卡，局域网可访问）' }
-]
-
-function isListenHost(value: unknown): value is ListenHost {
-  return value === '127.0.0.1' || value === '0.0.0.0'
+/** Whether a value looks like a concrete bind host (client-side guard only). */
+function isListenHost(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
 }
 
-/** Fetch the auth status (configured + runtime bind host). */
-async function fetchStatus(): Promise<{ configured: boolean; host?: ListenHost } | null> {
+interface StatusPayload {
+  configured: boolean
+  host?: string
+  allowed: ListenOption[]
+  needsMigration: boolean
+}
+
+/** Fetch the auth status (configured + runtime bind host + selectable addresses). */
+async function fetchStatus(): Promise<StatusPayload | null> {
   try {
     const response = await fetch('/api/web-auth/status')
     if (!response.ok) return null
-    const data = (await response.json()) as { configured?: boolean; host?: unknown }
-    return { configured: data.configured === true, host: isListenHost(data.host) ? data.host : undefined }
+    const data = (await response.json()) as {
+      configured?: boolean
+      host?: unknown
+      allowed?: unknown
+      needsMigration?: unknown
+    }
+    return {
+      configured: data.configured === true,
+      host: isListenHost(data.host) ? data.host : undefined,
+      allowed: Array.isArray(data.allowed) ? (data.allowed as ListenOption[]) : [],
+      needsMigration: data.needsMigration === true
+    }
   } catch {
     return null
   }
 }
 
-function WebAuthSettingsSection(props: SettingsSectionProps): JSX.Element | null {
-  const { scope } = props
-  // Bind the methods: React invokes getSnapshot/subscribe as bare functions,
-  // and SettingsScopeController's methods depend on `this`.
-  const snapshot = useSyncExternalStore(
-    (listener) => scope.subscribe(listener),
-    () => scope.getSnapshot()
-  )
+/** Ask the host half to switch the bind address; returns an error message on refusal. */
+async function postListenHost(host: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const response = await fetch('/api/web-auth/listen', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ host })
+    })
+    const data = (await response.json()) as { ok?: boolean; error?: string; message?: string }
+    if (response.ok && data.ok === true) return { ok: true }
+    return { ok: false, message: data.message ?? data.error ?? String(response.status) }
+  } catch {
+    return { ok: false, message: '网络错误' }
+  }
+}
+
+function WebAuthSettingsSection(): JSX.Element | null {
   const [configured, setConfigured] = useState<boolean | null>(null)
-  const [host, setHost] = useState<ListenHost | null>(null)
+  const [host, setHost] = useState<string | null>(null)
+  const [options, setOptions] = useState<ListenOption[]>([])
+  const [needsMigration, setNeedsMigration] = useState(false)
   const [oldPassword, setOldPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [confirm, setConfirm] = useState('')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
-  const [listenPick, setListenPick] = useState<ListenHost>('127.0.0.1')
+  const [listenPick, setListenPick] = useState<string>('')
   const [listenBusy, setListenBusy] = useState(false)
   const [listenMsg, setListenMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
@@ -178,20 +180,20 @@ function WebAuthSettingsSection(props: SettingsSectionProps): JSX.Element | null
     void fetchStatus().then((status) => {
       if (!alive || status === null) return
       setConfigured(status.configured)
-      if (status.host !== undefined) {
-        setHost(status.host)
-        setListenPick(status.host)
-      }
+      setOptions(status.allowed)
+      setNeedsMigration(status.needsMigration)
+      // Preselect the address that is actually live when it is selectable;
+      // otherwise fall back to the first (loopback) option instead of
+      // echoing a value the host half would refuse on write.
+      const selectable = status.host !== undefined && status.allowed.some((o) => o.value === status.host)
+      const pick = selectable ? (status.host as string) : (status.allowed[0]?.value ?? '')
+      setHost(status.host ?? null)
+      setListenPick(pick)
     })
     return () => {
       alive = false
     }
   }, [])
-
-  // The namespace is served by the host once the scope is ready. While it is
-  // merely loading, keep the page mounted (the sidebar already dispatched it);
-  // if it is unavailable (deployment without the host half), render nothing.
-  if (snapshot.status === 'unavailable') return null
 
   const submit = async (): Promise<void> => {
     if (newPassword.length < 8) {
@@ -221,31 +223,32 @@ function WebAuthSettingsSection(props: SettingsSectionProps): JSX.Element | null
   }
 
   const applyListen = async (): Promise<void> => {
-    if (host === listenPick) return
+    if (listenPick.length === 0 || host === listenPick) return
     setListenBusy(true)
     setListenMsg(null)
-    try {
-      // Write through the settings namespace (the host half applies the
-      // patch and HMR rebinds the webserver; the connection drops briefly).
-      await scope.set('listenHost', listenPick)
-      setListenMsg({ kind: 'ok', text: '已切换，正在重新绑定监听端口，页面将短暂断连…' })
-      // Poll until the new bind host is reported (the connection drops in
-      // between; fetch retries once the listener is back).
-      for (let i = 0; i < 15; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 600))
-        const status = await fetchStatus()
-        if (status?.host === listenPick) {
-          setHost(listenPick)
-          setListenMsg({ kind: 'ok', text: '已生效：监听地址为 ' + listenPick + '。' })
-          return
-        }
-      }
-      setListenMsg({ kind: 'ok', text: '已应用，若页面连接中断请稍候刷新（监听地址：' + listenPick + '）。' })
-    } catch {
-      setListenMsg({ kind: 'err', text: '写入失败，请重试。' })
-    } finally {
+    const result = await postListenHost(listenPick)
+    if (!result.ok) {
       setListenBusy(false)
+      setListenMsg({ kind: 'err', text: '写入失败：' + String(result.message) })
+      return
     }
+    setListenMsg({ kind: 'ok', text: '已切换，正在重新绑定监听端口，页面将短暂断连…' })
+    // Poll until the new bind host is reported (the connection drops in
+    // between; fetch retries once the listener is back).
+    for (let i = 0; i < 15; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 600))
+      const status = await fetchStatus()
+      if (status?.host === listenPick) {
+        setHost(listenPick)
+        setNeedsMigration(status.needsMigration)
+        setOptions(status.allowed)
+        setListenMsg({ kind: 'ok', text: '已生效：监听地址为 ' + listenPick + '。' })
+        setListenBusy(false)
+        return
+      }
+    }
+    setListenMsg({ kind: 'ok', text: '已应用，若页面连接中断请稍候刷新（监听地址：' + listenPick + '）。' })
+    setListenBusy(false)
   }
 
   return (
@@ -290,22 +293,30 @@ function WebAuthSettingsSection(props: SettingsSectionProps): JSX.Element | null
         <div className="dwa-field">
           <label className="dwa-label" htmlFor="dwa-listen">监听地址</label>
           <select id="dwa-listen" className="dwa-input" value={listenPick}
-            disabled={listenBusy || host === null || !snapshot.writable}
-            onChange={(e) => setListenPick(e.target.value as ListenHost)}>
-            {LISTEN_OPTIONS.map((option) => (
+            disabled={listenBusy || options.length === 0}
+            onChange={(e) => setListenPick(e.target.value)}>
+            {options.map((option) => (
               <option key={option.value} value={option.value}>{option.label}</option>
             ))}
           </select>
         </div>
         <div className="dwa-actions">
-          <button className="dwa-btn" disabled={listenBusy || host === null || host === listenPick || !snapshot.writable}
+          <button className="dwa-btn" disabled={listenBusy || listenPick.length === 0 || host === listenPick}
             onClick={() => void applyListen()}>
             应用监听地址
           </button>
         </div>
         <p className="dwa-hint">
-          切换后 dsh 会立即重新绑定监听端口（WebSocket 短暂断连后自动重连）。注意：若当前通过局域网 IP 访问，切回 127.0.0.1 后只能在本机访问。
+          列表是本机网卡上的具体地址。dsh 0.2.1-alpha.2 起不再接受 0.0.0.0 / ::（通配符会在解析配置阶段直接让
+          dsh 启动失败），需要局域网或反代访问请选择对应网卡地址，并优先在本机放一层反代指向 127.0.0.1。
+          注意：绑定具体网卡地址后 127.0.0.1 不再监听，本机也需改用该地址访问；若通过局域网 IP 访问，切回
+          127.0.0.1 后只能在本机访问。
         </p>
+        {needsMigration && (
+          <p className="dwa-msg" data-kind="err" role="alert">
+            当前配置的监听地址不是本插件可写入的具体地址（例如历史遗留的 0.0.0.0）。请改选一个网卡地址后应用。
+          </p>
+        )}
         {listenMsg !== null && <p className="dwa-msg" data-kind={listenMsg.kind} role="alert">{listenMsg.text}</p>}
       </div>
     </div>
@@ -313,34 +324,30 @@ function WebAuthSettingsSection(props: SettingsSectionProps): JSX.Element | null
 }
 
 /**
- * Client plugin body: register the settings page. The shell's declaration
- * may not be on the ledger yet, so the registration waits via slots.inject.
+ * Client plugin body: register the settings page.
+ *
+ * The page needs only the slot ledger — it reads and writes the password and
+ * the listen address through the plugin's own REST routes
+ * (/api/web-auth/{status,password,listen}). It deliberately does NOT bind the
+ * browser settings transport: dsh >= 0.2.1-alpha.2 removed the
+ * `settingsScope` client service (its settings plane is now the schema-driven
+ * SettingsForms on the host), so a page that waited for it would never
+ * register — the 访问认证 entry would silently vanish from Settings.
+ *
  * @param ctx - the client cordis context.
  */
 export function apply(ctx: Context): void {
-  // The 访问认证 settings page rides the settingsScope service, awaited through
-  // a callback-style inject: dsh >= 0.1.7 dropped that service (the host half's
-  // Config schema now feeds the official settings page), so the page registers
-  // only when the service exists and the plugin stays active either way. Never
-  // touch ctx.settingsScope directly — on a host without the service that
-  // access throws and fails the whole entry.
-  ctx.inject(['settingsScope'], (raw: unknown) => {
-    const c = raw as {
-      slots: Slots
-      settingsScope?: { bind(spec: { namespace: string }): SettingsScopeFace }
-    }
-    if (c.settingsScope === undefined) return
-
+  ctx.inject(['slots'], (raw: unknown) => {
+    const c = raw as { slots: Slots }
     injectStyle()
-    const scope = c.settingsScope.bind({ namespace: WEB_AUTH_NS })
     c.slots.inject('settings.section', () =>
       c.slots.register(
         {
           name: 'settings.section',
-          id: 'web-auth',
+          id: WEB_AUTH_NS,
           order: 120,
           label: '访问认证',
-          inject: () => ({ scope })
+          inject: () => ({})
         },
         WebAuthSettingsSection
       )

@@ -19,10 +19,10 @@ import {
 } from './auth-core.ts'
 import { renderLoginPage } from './login-page.ts'
 import {
-  ALLOWED_LISTEN_HOSTS,
   isAllowedListenHost,
   type ListenHost
 } from './profile-patch.ts'
+import { isLocalPeerAddress, listListenHosts, type ListenHostOption } from './listen-addresses.ts'
 
 /** Maximum accepted request body for the login form / API. */
 export const MAX_BODY_BYTES = 16 * 1024
@@ -116,13 +116,16 @@ export function cookieValue(header: string | undefined, name: string): string | 
 
 /**
  * The client address for rate limiting. X-Forwarded-For is honored ONLY when
- * the direct peer is loopback (the reverse proxy sits on the same host), so
- * a remote attacker hitting dsh directly cannot forge a fresh identity.
+ * the direct peer is local (a reverse proxy on this host), so a remote
+ * attacker hitting dsh directly cannot forge a fresh identity.
+ *
+ * "Local" is the machine's own address set, not just loopback: a concrete LAN
+ * bind stops listening on `127.0.0.1` entirely, so a same-host proxy arrives
+ * FROM the bound address. See isLocalPeerAddress.
  */
 export function clientIp(req: IncomingMessage): string {
   const direct = req.socket.remoteAddress ?? 'unknown'
-  const loopback = direct === '127.0.0.1' || direct === '::1' || direct === '::ffff:127.0.0.1'
-  if (loopback) {
+  if (isLocalPeerAddress(direct)) {
     const xff = req.headers['x-forwarded-for']
     if (typeof xff === 'string') {
       const first = xff.split(',')[0]?.trim()
@@ -261,15 +264,16 @@ export function tokenQueryCount(req: IncomingMessage): number {
 export const MINT_REENTRY_HEADER = 'x-dsh-web-auth-mint'
 
 /**
- * Whether this tokened request is the server-side mint's own loopback
- * re-entry: the marker header AND a direct loopback TCP peer (not
- * clientIp's XFF-aware view — a proxied remote client must not pass even
- * if it forges the header, and the mint never traverses the proxy).
+ * Whether this tokened request is the server-side mint's own local re-entry:
+ * the marker header AND a direct local TCP peer (not clientIp's XFF-aware
+ * view — a proxied remote client must not pass even if it forges the header,
+ * and the mint never traverses the proxy). "Local" covers the bound address
+ * as well as loopback, because a concrete LAN bind has no loopback listener
+ * for the mint to come back through.
  */
 function isMintReentry(req: IncomingMessage): boolean {
   if (req.headers[MINT_REENTRY_HEADER] !== '1') return false
-  const direct = req.socket.remoteAddress ?? ''
-  return direct === '127.0.0.1' || direct === '::1' || direct === '::ffff:127.0.0.1'
+  return isLocalPeerAddress(req.socket.remoteAddress ?? undefined)
 }
 
 /**
@@ -586,9 +590,32 @@ export function handleLogout(req: IncomingMessage, res: ServerResponse, env: Han
 
 // ── GET /api/web-auth/status — settings page state ─────────────────────────
 
+/**
+ * The settings page's state: whether a password is configured, the current
+ * bind host, the writable concrete addresses of this machine, and whether the
+ * configured host needs migrating.
+ *
+ * `allowed` holds only addresses this plugin may write (loopback plus the
+ * machine's interfaces), so the page can never offer a value the write path
+ * would refuse. `needsMigration` is true when the resolved host is outside
+ * that domain — the wildcard (only reachable on hosts older than
+ * 0.2.1-alpha.2, since a newer boot would have failed already), a hostname,
+ * or an address this machine does not have; the page warns and preselects a
+ * concrete address instead of echoing a value that would be refused.
+ */
 export function handleStatus(req: IncomingMessage, res: ServerResponse, env: HandlerEnv): void {
-  const body: { configured: boolean; host?: string } = { configured: env.state.readHash() !== undefined }
   const current = env.listen?.current()
+  const options: ListenHostOption[] = listListenHosts()
+  const body: {
+    configured: boolean
+    host?: string
+    allowed: ListenHostOption[]
+    needsMigration: boolean
+  } = {
+    configured: env.state.readHash() !== undefined,
+    allowed: options,
+    needsMigration: current !== undefined && !isAllowedListenHost(current)
+  }
   if (current !== undefined) body.host = current
   writeJson(res, 200, body)
 }
@@ -653,7 +680,7 @@ export interface ListenChangeBody {
 }
 
 /**
- * Switch the web server's bind host between '127.0.0.1' and '0.0.0.0'.
+ * Switch the web server's bind host to a concrete local interface address.
  *
  * The change is applied to the owning patch layer (profile or home
  * cordis.patch.yml); HMR then reloads the webserver row, which closes and
@@ -661,6 +688,11 @@ export interface ListenChangeBody {
  * committed — the reload tears down every connection, including this one —
  * so the client gets its confirmation first and the write lands a beat
  * later (see {@link ListenController}).
+ *
+ * The wildcard is refused with 400: it is not a bind this plugin may store,
+ * because dsh >= 0.2.1-alpha.2 fails the whole startup on it while resolving
+ * config. The response lists the selectable addresses so a stale client can
+ * correct itself.
  */
 export async function handleListenChange(req: IncomingMessage, res: ServerResponse, env: HandlerEnv): Promise<void> {
   const body = await readBody(req)
@@ -676,7 +708,11 @@ export async function handleListenChange(req: IncomingMessage, res: ServerRespon
     return
   }
   if (!isAllowedListenHost(parsed.host)) {
-    writeJson(res, 400, { error: 'invalid-host', allowed: [...ALLOWED_LISTEN_HOSTS] })
+    writeJson(res, 400, {
+      error: 'invalid-host',
+      message: 'bind a concrete IPv4/IPv6 address this machine has (the wildcard and unowned addresses are refused)',
+      allowed: listListenHosts()
+    })
     return
   }
   const listen = env.listen
