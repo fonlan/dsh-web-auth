@@ -2,6 +2,17 @@
 
 兼容性一栏列出该版本支持的 DSH 宿主版本区间。
 
+## 0.2.4
+
+**兼容性**：dsh `^0.1.2-alpha.2 || ^0.2.0-rc.1 || ^0.2.1-alpha.1 || ^0.2.1-alpha.2 || ^0.2.1-rc.2 || ^0.2.1-rc.3 || ^0.2.1-rc.5 || ^0.2.2-rc.3` —— 已在 DSH Desktop `0.2.2-rc.3` 上验证（隔离 profile 冷启动通过）。
+
+**变更**
+- 构建基线 `@deepseek-ai/*` 从 `0.2.1-rc.5` 升到 `0.2.2-rc.3`（`@deepseek-ai/cordis` `4.1.0`、`@deepseek-ai/schemastery` `3.19.0`）。
+- 每个 `@deepseek-ai/dsh*` 的 `peerDependencies` 追加 `|| ^0.2.2-rc.3`，`@deepseek-ai/cordis` peer 提到 `^4.1.0`。
+- 源码零改动：登录门禁、`/login` 与 `?token=` mint 流程在 0.2.2 上复测一致（未登录 302、mint 303 落 cookie）。
+
+**验证**：`pnpm install` / `typecheck` / `build` / `test`（111 项）全部通过；隔离 profile 冷启动（真 `0.2.2-rc.3` 宿主）通过。
+
 ## 0.2.3
 
 **兼容性**：dsh `^0.1.2-alpha.2 || ^0.2.0-rc.1 || ^0.2.1-alpha.1 || ^0.2.1-alpha.2 || ^0.2.1-rc.2 || ^0.2.1-rc.3 || ^0.2.1-rc.5` —— 已在 DSH Desktop `0.2.1-rc.5` 上验证（隔离 profile 冷启动 `pass-timeout-alive`）。
